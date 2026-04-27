@@ -1,1 +1,258 @@
 
+// ======================================================
+// 1. SETTINGS
+// ======================================================
+var startYear = 2008;
+var endYear   = 2024;
+var startMonth = 3;
+var endMonth   = 10;
+
+// ⚠️ NOTE:
+// 2008 has no lagged CDL (no 2007 CDL exists)
+
+var stateNames = [
+  "North Dakota","South Dakota","Nebraska","Kansas",
+  "Minnesota","Iowa","Missouri","Wisconsin",
+  "Illinois","Michigan","Indiana","Ohio"
+];
+
+var CORN_CLASS = 1;
+
+// ======================================================
+// MASK SETTINGS
+// ======================================================
+var MASK_TYPE = "lagged";
+var FIVE_YEAR_THRESHOLD = 0.6;
+
+// ======================================================
+// 2. LOAD COUNTIES & STATES
+// ======================================================
+var counties = ee.FeatureCollection("TIGER/2018/Counties");
+var states   = ee.FeatureCollection("TIGER/2018/States");
+
+var selectedStates = states.filter(ee.Filter.inList('NAME', stateNames));
+var stateFPList = selectedStates.aggregate_array('STATEFP');
+var selectedCounties = counties.filter(ee.Filter.inList('STATEFP', stateFPList));
+
+// ======================================================
+// 3. VEGETATION INDEX FUNCTION (NDVI + NDMI + NDWI)
+// ======================================================
+function addIndices(image) {
+
+  var img = ee.Image(image);
+
+  var red   = img.select('sur_refl_b01').multiply(0.0001);
+  var nir   = img.select('sur_refl_b02').multiply(0.0001);
+  var green = img.select('sur_refl_b04').multiply(0.0001);
+  var swir  = img.select('sur_refl_b06').multiply(0.0001);
+
+  // NDVI (NEW — correct)
+  var ndvi = nir.subtract(red)
+    .divide(nir.add(red))
+    .rename('NDVI');
+
+  // EVI (from MODIS)
+  var evi = img.select('EVI').multiply(0.0001)
+    .rename('EVI_scaled');
+
+  // EVI2
+  var evi2 = nir.subtract(red)
+    .multiply(2.5)
+    .divide(nir.add(red.multiply(2.4)).add(1))
+    .rename('EVI2');
+
+  // GCI
+  var gci = nir.divide(green)
+    .subtract(1)
+    .rename('GCI');
+
+  // NIRv
+  var nirv = ndvi.multiply(nir)
+    .rename('NIRv');
+
+  // NDMI (moisture — your original NDWI)
+  var ndmi = nir.subtract(swir)
+    .divide(nir.add(swir))
+    .rename('NDMI');
+
+  // TRUE NDWI (water index)
+  var ndwi = green.subtract(nir)
+    .divide(green.add(nir))
+    .rename('NDWI');
+
+  return img.addBands([
+      ndvi,
+      evi,
+      evi2,
+      nirv,
+      gci,
+      ndmi,
+      ndwi
+    ])
+    .select([
+      'NDVI',
+      'EVI_scaled',
+      'EVI2',
+      'NIRv',
+      'GCI',
+      'NDMI',
+      'NDWI'
+    ]);
+}
+
+// ======================================================
+// 4. MASK FUNCTION
+// ======================================================
+function getCornMask(year) {
+
+  year = ee.Number(year);
+
+  if (MASK_TYPE === "none") {
+    return ee.Image.constant(1).rename('corn_mask');
+  }
+
+  if (MASK_TYPE === "same_year") {
+
+    var sameYearCDL = ee.ImageCollection("USDA/NASS/CDL")
+      .filter(ee.Filter.calendarRange(year, year, 'year'))
+      .first()
+      .select('cropland');
+
+    return sameYearCDL.eq(CORN_CLASS).rename('corn_mask');
+  }
+
+  if (MASK_TYPE === "lagged") {
+
+    var lagYear = year.subtract(1);
+
+    var laggedCDL = ee.ImageCollection("USDA/NASS/CDL")
+      .filter(ee.Filter.calendarRange(lagYear, lagYear, 'year'))
+      .first();
+
+    return ee.Algorithms.If(
+      laggedCDL,
+      ee.Image(laggedCDL).select('cropland').eq(CORN_CLASS),
+      ee.Image.constant(1)
+    );
+  }
+
+  // five-year mask
+  var cdlYears = ee.List.sequence(year.subtract(5), year.subtract(1));
+
+  var cdlStack = ee.ImageCollection.fromImages(
+    cdlYears.map(function(y) {
+      var cdl = ee.ImageCollection("USDA/NASS/CDL")
+        .filter(ee.Filter.calendarRange(y, y, 'year'))
+        .first()
+        .select('cropland');
+      return cdl.eq(CORN_CLASS);
+    })
+  );
+
+  var cornFreq5yr = cdlStack.mean();
+  return cornFreq5yr.gte(FIVE_YEAR_THRESHOLD);
+}
+
+// ======================================================
+// 5. COLLECT DATA
+// ======================================================
+var allYearsStats = ee.List([]);
+
+for (var year = startYear; year <= endYear; year++) {
+
+  print('Processing year:', year);
+
+  var startDate = ee.Date.fromYMD(year, startMonth, 1);
+  var endDate   = ee.Date.fromYMD(year, endMonth, 31);
+
+  var cornMask = ee.Image(getCornMask(year));
+
+  var mod13 = ee.ImageCollection("MODIS/061/MOD13Q1")
+    .filterDate(startDate, endDate)
+    .map(function(img) {
+      return img.updateMask(img.select('SummaryQA').lte(1));
+    });
+
+  var mod09 = ee.ImageCollection("MODIS/061/MOD09A1")
+    .filterDate(startDate, endDate);
+
+  var joined = ee.Join.inner().apply(
+    mod13,
+    mod09,
+    ee.Filter.equals({
+      leftField: 'system:time_start',
+      rightField: 'system:time_start'
+    })
+  );
+
+  var processedCol = ee.ImageCollection(
+    joined.map(function(f) {
+      return ee.Image(f.get('primary'))
+        .addBands(ee.Image(f.get('secondary')))
+        .updateMask(cornMask);
+    })
+  ).map(addIndices);
+
+  var yearStats = processedCol.map(function(image) {
+
+    var dateString = image.date().format('YYYY-MM-dd');
+
+    return image.reduceRegions({
+      collection: selectedCounties,
+      reducer: ee.Reducer.mean(),
+      scale: 250,
+      tileScale: 8
+    }).map(function(f) {
+      return f.set({
+        'date': dateString,
+        'year': year,
+        'mask_type': MASK_TYPE
+      });
+    });
+
+  }).flatten();
+
+  allYearsStats = allYearsStats.add(yearStats);
+}
+
+var finalCollection = ee.FeatureCollection(allYearsStats).flatten();
+
+// Safe preview (avoid timeout)
+print('Preview:', finalCollection.limit(10));
+
+// ======================================================
+// 6. EXPORT
+// ======================================================
+stateNames.forEach(function(stateName) {
+
+  var stateFP = selectedStates
+    .filter(ee.Filter.eq('NAME', stateName))
+    .first()
+    .get('STATEFP');
+
+  var stateData = finalCollection
+    .filter(ee.Filter.eq('STATEFP', stateFP));
+
+  Export.table.toDrive({
+    collection: stateData,
+    description: 'Corn_MODIS_' + MASK_TYPE + '_' + stateName.replace(/\s/g, "_"),
+    folder: 'EarthEngineExports',
+    fileNamePrefix: 'Corn_MODIS_' + MASK_TYPE + '_' + stateName.replace(/\s/g, "_"),
+    fileFormat: 'CSV',
+    selectors: [
+      'NAME',
+      'GEOID',
+      'STATEFP',
+      'date',
+      'year',
+      'mask_type',
+      'NDVI',
+      'EVI_scaled',
+      'EVI2',
+      'NIRv',
+      'GCI',
+      'NDMI',
+      'NDWI'
+    ]
+  });
+});
