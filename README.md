@@ -9,4 +9,4 @@ This project is broken into a few parts.
 
 3) The yield file from 2008-2024 and the gee files from each state for 2008-2024 can be found in the zip file labeled final lagged cdls and yield file. please download this zip file to be able to run the model if interested. 
 
-4) The code and its outputs can be found in in the file copy_of_offline_proper_cdl.ipynb making this replicatable.
+4) The code and its outputs can be found in in the file copy_of_offline_proper_cdl(4).ipynb making this replicatable.
