@@ -10,3 +10,4 @@ This project is broken into a few parts.
 3) The yield file from 2008-2024 and the gee files from each state for 2008-2024 can be found in the zip file labeled final lagged cdls and yield file. please download this zip file to be able to run the model if interested. 
 
 4) The code and its outputs can be found in in the file Kernal kollectors model code.ipynb making this replicatable.
+5.)The authors have submitted an entry for the AGCO competition! over the next few days we will be updating the available code to post results from 2025 since they came out 7 days ago at the time of this post. 
