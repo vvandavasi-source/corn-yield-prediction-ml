@@ -11,4 +11,3 @@ This project is broken into a few parts.
 
 4) The code and its outputs can be found in in the file Kernal kollectors model code.ipynb making this replicatable.
    
-5.)The authors have submitted an entry for the AGCO competition! over the next few days we will be updating the available code to post results from 2025 since they came out 7 days ago at the time of this post. 
