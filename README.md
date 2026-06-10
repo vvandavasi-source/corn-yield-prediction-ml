@@ -11,3 +11,4 @@ This project is broken into a few parts.
 
 4) The code and its outputs can be found in in the file Kernal kollectors model code.ipynb making this replicatable.
    
+5.) Recently NASS Released data for the 2025 corn collection season. We've added this data to our model and labeled it Kernal kollectors model code 2025 
