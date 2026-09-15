@@ -56,7 +56,7 @@ this is designed to be user-friendly and should work on both Windows and Mac. Ju
 LTR
 """
 # This creates a 'data' folder in the same folder where your script is running
-DATA_DIR = os.path.join(os.getcwd(), "data")
+DATA_DIR = os.path.join(os.getcwd(), "downloaded_csvs")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # 2. SELECT FILES. Will bring up a window to select your GEE ZIP or CSV files + yield CSV. You can select multiple files at once.
@@ -139,14 +139,14 @@ same_year_csvs = [
     and "prev" not in os.path.basename(f).lower()
 ]
 
-lagged_csvs = [
+"""lagged_csvs = [
     f for f in all_csvs
     if "Corn_MODIS" in os.path.basename(f)
     and (
         "lag" in os.path.basename(f).lower()
         or "prev" in os.path.basename(f).lower()
     )
-]
+]"""
 
 print("==================================================")
 print("SAME-YEAR FILES FOUND:", len(same_year_csvs))
@@ -154,16 +154,16 @@ print("==================================================")
 for f in same_year_csvs[:10]:
     print(os.path.basename(f))
 
-
+"""
 print("LAGGED-CDL FILES FOUND:", len(lagged_csvs))
 
 for f in lagged_csvs[:10]:
     print(os.path.basename(f))
-
-    """
+"""
+"""
     BUILD WIDE GEE FUNCTION
     
-    """
+"""
 veg_cols = [
         "NDVI_scaled",
         "EVI_scaled",
@@ -193,8 +193,6 @@ def build_gee_wide(csv_list):
         df = pd.read_csv(f, low_memory=False)
         df.columns = [c.strip() for c in df.columns]
 
-
-        df = df.rename(columns=rename_map)
 
         needed = [
             "NAME",
@@ -294,13 +292,13 @@ BUILD SAME-YEAR AND LAGGED GEE TABLES
 """
 
 same_year_gee_wide = build_gee_wide(same_year_csvs)
-lagged_gee_wide = build_gee_wide(lagged_csvs)
+#lagged_gee_wide = build_gee_wide(lagged_csvs)
 
 print("\n==================================================")
 print("FINAL DATASET SHAPES")
 print("==================================================")
 print("Same-year GEE shape:", same_year_gee_wide.shape)
-print("Lagged-CDL GEE shape:", lagged_gee_wide.shape)
+#print("Lagged-CDL GEE shape:", lagged_gee_wide.shape)
 
 
 
@@ -341,8 +339,9 @@ print("Extracted Parameters:", same_year_df.head())
 
 """
 # CELL 5 — INTERPOLATE LAGGED-CDL DATA
-"""
 
+
+lagged_gee_wide = build_gee_wide(lagged_csvs)
 lagged_cdl_df = lagged_gee_wide.copy()
 
 lagged_cdl_df = lagged_cdl_df.sort_values(
@@ -369,6 +368,7 @@ print("lagged-year interpolation complete")
 print("Shape:", lagged_cdl_df.shape)
 print("Extracted Parameters:", lagged_cdl_df.head())
 """
+"""
 # FIND YIELD FILE PATH
 # Run this BEFORE the yield_df cell
 """
@@ -386,8 +386,8 @@ YIELD_PATH = yield_candidates[0]
 
 print("\nUsing yield file:")
 print(YIELD_PATH)
-print("Lagged-CDL interpolation complete")
-print("Shape:", lagged_cdl_df.shape)
+#print("Lagged-CDL interpolation complete")
+#print("Shape:", lagged_cdl_df.shape)
 
 """
 # FIX YIELD_DF NOT FOUND
@@ -440,7 +440,7 @@ yield_df["GEOID"] = (
 )
 
 yield_df = yield_df[
-    ["GEOID", "year", "yield_bu_acre"]
+    ["GEOID", "year", "yield_bu_acre", "State"]
 ].drop_duplicates()
 
 print("Yield dataframe shape:", yield_df.shape)
@@ -460,25 +460,27 @@ same_year_df = same_year_df.merge(
     validate="one_to_one"
 )
 
+'''
 lagged_cdl_df = lagged_cdl_df.merge(
     yield_df[["GEOID", "year", "yield_bu_acre", "State"]],
     on=["GEOID", "year"],
     how="inner",
     validate="one_to_one"
 )
+'''
 
 print("Same-year merged shape:", same_year_df.shape)
-print("Lagged merged shape:", lagged_cdl_df.shape)
+#print("Lagged merged shape:", lagged_cdl_df.shape)
 print("Merged datasets now contain yield data. Sample rows:")
 print("\nSame-year sample:")
 print(same_year_df.head())
-print("\nLagged-CDL sample:")
-print(lagged_cdl_df.head())
+#print("\nLagged-CDL sample:")
+#print(lagged_cdl_df.head())
 
 def merged_df():
-    return same_year_df, lagged_cdl_df
+    return same_year_df
 
-veg_cols_long = list({col for col in same_year_df.columns if col in lagged_cdl_df.columns and any(v in col for v in [
+veg_cols_long = list({col for col in same_year_df.columns if any(v in col for v in [
     "NDVI_scaled",
     "EVI_scaled",
     "EVI2",
@@ -538,15 +540,15 @@ def generate_combined_matrix(target_path, nass_file):
     return matrix
 
 # Execution - Process both same-year and lagged data
-final_matrix_same_year = generate_combined_matrix(same_year_gee_wide).pivot(index='id', columns='year', values='status').fillna(0).reset_index()
+final_matrix_same_year = generate_combined_matrix(DATA_DIR, YIELD_PATH)
 final_matrix_same_year.to_csv('master_combined_alignment_same_year.csv')
 
-final_matrix_lagged = generate_combined_matrix(lagged_gee_wide).pivot(index='id', columns='year', values='status').fillna(0).reset_index()
-final_matrix_lagged.to_csv('master_combined_alignment_lagged.csv')
+#final_matrix_lagged = generate_combined_matrix(lagged_gee_wide, YIELD_PATH).pivot(index='id', columns='year', values='status').fillna(0).reset_index()
+#final_matrix_lagged.to_csv('master_combined_alignment_lagged.csv')
 
 def generate_alignment_with_heatmap(target_dir, nass_file):
     # 1. Extract MODIS files from the subdirectory
-    modis_csvs = glob.glob(os.path.join(target_dir, "Corn_MODIS_lagged*.csv"))
+    modis_csvs = glob.glob(os.path.join(target_dir, "Corn_MODIS_same_year*.csv"))
     
     all_modis_list = []
     
@@ -555,7 +557,7 @@ def generate_alignment_with_heatmap(target_dir, nass_file):
     
     # NEW LOGIC: Correctly captures "NORTH DAKOTA" from "Corn_MODIS_2008_2024_North_Dakota.csv"
         filename = os.path.basename(f)
-        state_part = filename.split('lagged')[-1].replace('.csv', '')
+        state_part = filename.split('same_year')[-1].replace('.csv', '')
         state_label = state_part.replace('_', ' ').upper()
     
         df['state_src'] = state_label
@@ -609,12 +611,12 @@ def generate_alignment_with_heatmap(target_dir, nass_file):
     return heatmap_matrix
 
 # Execute using pre-loaded GEE dataframes
-heatmap_data_same_year = generate_alignment_with_heatmap(same_year_df)
-heatmap_data_lagged = generate_alignment_with_heatmap(lagged_cdl_df)
+heatmap_data_same_year = generate_alignment_with_heatmap(DATA_DIR, nass_file=os.path.basename(YIELD_PATH))
+# heatmap_data_lagged = generate_alignment_with_heatmap(lagged_cdl_df)
 print("Alignment matrices and heatmaps generated for both same-year and lagged datasets.")
 print("Same-year heatmap data (state-level alignment percentages):")
 print(heatmap_data_same_year)
-print("Lagged heatmap data (state-level alignment percentages):")
-print(heatmap_data_lagged)
+# print("Lagged heatmap data (state-level alignment percentages):")
+# print(heatmap_data_lagged)
     
 
