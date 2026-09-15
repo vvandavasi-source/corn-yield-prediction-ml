@@ -119,7 +119,7 @@ FILE SUMMARY & MODULE DESCRIPTIONS
    - Saves high-resolution visualization plots (`feature_importance_<dataset>.png`).
 
 
-6. model_comparison_same_prev_cdl.py
+6. model_comparison.py
    ---------------------------------
    Purpose:
    Main orchestration script for model training, within-season progression benchmark, 
