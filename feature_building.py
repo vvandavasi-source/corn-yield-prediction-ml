@@ -4,13 +4,13 @@ import numpy as np
 from numpy import nanmean
 from scipy import integrate
 from numpy import trapezoid
-same_year_df, lagged_cdl_df = dp.merged_df()
+same_year_df= dp.merged_df()
 
 # ============================================================
 # BUILD HISTORICAL FEATURES FOR BOTH
 # ============================================================
 
-for temp_df in [same_year_df, lagged_cdl_df]:
+for temp_df in [same_year_df]:
 
     temp_df["hist_5yr"] = (
         temp_df.groupby("GEOID")["yield_bu_acre"]
@@ -43,7 +43,7 @@ print("Historical features created")
 
 veg_indices = ["EVI_scaled", "EVI2", "NDWI", "NIRv", "GCI"]
 
-for temp_df in [same_year_df, lagged_cdl_df]:
+for temp_df in [same_year_df]:
 
     for idx in veg_indices:
 
@@ -74,12 +74,9 @@ same_year_df = same_year_df[
     same_year_df["hist_5yr"].notna()
 ].copy()
 
-lagged_cdl_df = lagged_cdl_df[
-    lagged_cdl_df["hist_5yr"].notna()
-].copy()
 
 print("Same-year rows:", len(same_year_df))
-print("Lagged rows:", len(lagged_cdl_df))
+
 
 """build historical features
 """
@@ -209,5 +206,8 @@ def build_features(df_sub, doy_cut):
         return pd.DataFrame(index=df_sub.index)
 
     return pd.concat(feature_list, axis=1)
+
+
+
 
 
