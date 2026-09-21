@@ -2,7 +2,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-CORN YIELD 2 — Canonical compact-PRISM yield model
+CORN YIELD 2 — Canonical compact-PRISM yield model — V2 AUDITED
 
 This script replaces the former notebook Cells 1–18 and is the canonical
 saved yield-model workflow after feature ablation.
@@ -37,20 +37,21 @@ Workflow:
   6. Build season-to-date vegetation features.
   7. Fit the fixed XGBoost anomaly model with hist_5yr + year.
   8. Run expanding-year seasonal validation.
-  9. Run the 2022/2023 ICDL deployment comparison using the SAME model spec.
+  9. Run dynamically discovered requested-year ICDL deployment comparisons.
+ 10. Run J-style forecast-encompassing tests where paired scenarios exist.
 
 Local usage:
-    python corn_yield_model_CY2_COMPACT_PRISM_CANONICAL.py ^
-        --input-dir "C:\\path\\to\\input_files" ^
-        --work-dir "D:\\corn_yield\\yield_model_work" ^
-        --output-dir "D:\\corn_yield\\yield_model_results"
+    python corn_yield_model_CY2_COMPACT_PRISM_CANONICAL_V2_AUDITED.py ^
+        --input-dir "C:\\Users\\logan\\OneDrive\\BSE 508\\corn_yield_model_input" ^
+        --work-dir "C:\\Users\\logan\\OneDrive\\BSE 508\\corn_yield_model_work" ^
+        --output-dir "C:\\Users\\logan\\OneDrive\\BSE 508\\corn_yield_model_results"
 
 The input directory may contain CSV files directly and/or ZIP archives.
 ZIP archives are extracted into the work directory. Source inputs are not
 modified.
 
 Dependencies:
-    numpy pandas matplotlib scikit-learn xgboost
+    numpy pandas matplotlib scikit-learn scipy xgboost
 """
 
 # ============================================================
@@ -77,6 +78,7 @@ from sklearn.metrics import (
 )
 
 from xgboost import XGBRegressor
+from scipy import stats
 
 try:
     from IPython.display import display
@@ -90,7 +92,18 @@ pd.set_option("display.max_columns", 250)
 pd.set_option("display.width", 240)
 
 
-MODEL_VERSION = "CY2_COMPACT_PRISM_CANONICAL_V1"
+
+MODEL_VERSION = "CY2_COMPACT_PRISM_CANONICAL_V2_2_AUDITED_2021_2023"
+
+# ============================================================
+# VALIDATION WINDOW — CHANGE ONLY END YEAR LATER
+# ============================================================
+# Current interim run: 2021–2023.
+# When 2024/2025 SAME-YEAR FINAL-CDL MODIS exports are ready,
+# change VALIDATION_END_YEAR from 2023 to 2025 and rerun.
+VALIDATION_START_YEAR = 2021
+VALIDATION_END_YEAR = 2023
+VALIDATION_TAG = f"{VALIDATION_START_YEAR}_{VALIDATION_END_YEAR}"
 
 # The fixed model configuration selected by the controlled ablation.
 XGB_PARAMS = {
@@ -113,19 +126,19 @@ def parse_args():
 
     parser.add_argument(
         "--input-dir",
-        default=".",
+        default=r"C:\Users\logan\OneDrive\BSE 508\corn_yield_model_input",
         help="Directory containing required CSVs and/or ZIP archives.",
     )
 
     parser.add_argument(
         "--work-dir",
-        default="./corn_yield_model_work",
+        default=r"C:\Users\logan\OneDrive\BSE 508\corn_yield_model_work",
         help="Scratch directory used for extracted/staged inputs.",
     )
 
     parser.add_argument(
         "--output-dir",
-        default="./corn_yield_model_results",
+        default=r"C:\Users\logan\OneDrive\BSE 508\corn_yield_model_results",
         help="Directory for validation and ICDL result files.",
     )
 
@@ -145,6 +158,8 @@ print("Output directory:", OUTPUT_DIR_BASE)
 
 print("Model version    :", MODEL_VERSION)
 print("Feature policy   : vegetation + veg anomalies + hist_5yr + year + 15 compact PRISM")
+print(f"Validation window: {VALIDATION_START_YEAR}–{VALIDATION_END_YEAR}")
+print("To extend later, change only VALIDATION_END_YEAR near the top of the script.")
 # ============================================================
 # CELL 2 — DISCOVER + STAGE INPUT FILES
 # ============================================================
@@ -164,33 +179,37 @@ source_zips = []
 
 work_resolved = Path(WORK_DIR).resolve()
 output_resolved = Path(OUTPUT_DIR_BASE).resolve()
+input_root = Path(INPUT_DIR)
 
-for path in Path(INPUT_DIR).rglob("*"):
-    if not path.is_file():
-        continue
 
+def _outside_generated_dirs(path):
+    """Return True only for source files outside work/output trees."""
     resolved = path.resolve()
 
-    # Never re-ingest our own work or result directories.
-    try:
-        resolved.relative_to(work_resolved)
-        continue
-    except ValueError:
-        pass
+    for generated_root in (work_resolved, output_resolved):
+        try:
+            resolved.relative_to(generated_root)
+            return False
+        except ValueError:
+            pass
 
-    try:
-        resolved.relative_to(output_resolved)
-        continue
-    except ValueError:
-        pass
+    return True
 
-    suffix = path.suffix.lower()
 
-    if suffix == ".csv":
-        source_csvs.append(path)
+# Search only file types this workflow can ingest. This avoids walking large
+# raster/cache trees just to reject every non-CSV/non-ZIP file afterward.
+for pattern in ("*.csv", "*.CSV"):
+    for path in input_root.rglob(pattern):
+        if path.is_file() and _outside_generated_dirs(path):
+            source_csvs.append(path)
 
-    elif suffix == ".zip":
-        source_zips.append(path)
+for pattern in ("*.zip", "*.ZIP"):
+    for path in input_root.rglob(pattern):
+        if path.is_file() and _outside_generated_dirs(path):
+            source_zips.append(path)
+
+source_csvs = sorted(set(source_csvs))
+source_zips = sorted(set(source_zips))
 
 
 print("\nSource CSV files:", len(source_csvs))
@@ -292,6 +311,7 @@ for f in sorted(all_csvs)[:50]:
 # ============================================================
 
 same_year_csvs = []
+final_cdl_historical_candidates = []
 prism_csvs = []
 yield_candidates = []
 
@@ -308,6 +328,30 @@ for f in all_csvs:
     if "corn_modis_same_year" in lower:
 
         same_year_csvs.append(
+            f
+        )
+
+        continue
+
+
+    # ========================================================
+    # HISTORICAL FINAL-CDL FALLBACK
+    #
+    # Older scenario exports such as:
+    #   Corn_MODIS_2023_FINAL_CDL.csv
+    # are scientifically equivalent to a same-year final-CDL
+    # vegetation export for historical training.  Keep them as
+    # fallback candidates, but only use a year if the canonical
+    # corn_modis_same_year inputs do not already cover it.
+    # ========================================================
+
+    if re.match(
+        r"^corn_modis_20\d{2}_final_cdl(?:\s*\(\d+\))?\.csv$",
+        lower,
+        flags=re.IGNORECASE,
+    ):
+
+        final_cdl_historical_candidates.append(
             f
         )
 
@@ -354,6 +398,10 @@ for f in all_csvs:
 
 same_year_csvs = sorted(
     same_year_csvs
+)
+
+final_cdl_historical_candidates = sorted(
+    final_cdl_historical_candidates
 )
 
 prism_csvs = sorted(
@@ -424,6 +472,10 @@ same_year_csvs = _dedupe_file_list(
     same_year_csvs
 )
 
+final_cdl_historical_candidates = _dedupe_file_list(
+    final_cdl_historical_candidates
+)
+
 prism_csvs = _dedupe_file_list(
     prism_csvs
 )
@@ -453,6 +505,13 @@ print(
 )
 
 print(
+    "Historical FINAL_CDL fallback candidates:",
+    len(
+        final_cdl_historical_candidates
+    )
+)
+
+print(
     "PRISM weather files:",
     len(
         prism_csvs
@@ -476,6 +535,18 @@ print(
 )
 
 for f in same_year_csvs:
+
+    print(
+        " ",
+        os.path.basename(f)
+    )
+
+
+print(
+    "\nFINAL_CDL fallback candidates:"
+)
+
+for f in final_cdl_historical_candidates:
 
     print(
         " ",
@@ -867,25 +938,21 @@ def build_gee_wide(
 
 
     if duplicates.any():
+        duplicate_examples = (
+            gee_long.loc[
+                duplicates,
+                ["GEOID", "year", "DOY"]
+            ]
+            .drop_duplicates()
+            .head(20)
+        )
 
-        gee_long = (
-
-            gee_long
-
-            .groupby(
-
-                [
-                    "GEOID",
-                    "year",
-                    "DOY"
-                ],
-
-                as_index=False
-
-            )[VEG_INDICES]
-
-            .mean()
-
+        raise ValueError(
+            f"{label}: duplicate GEOID-year-DOY observations detected. "
+            "The audited workflow will NOT silently average overlapping MODIS inputs. "
+            "This usually means both an annual whole-Corn-Belt export and overlapping "
+            "state-level files are present, or duplicate source products were staged. "
+            f"First duplicate keys:\n{duplicate_examples.to_string(index=False)}"
         )
 
 
@@ -1024,6 +1091,104 @@ if same_year_gee_wide.empty:
 
     raise RuntimeError(
         "No usable SAME-YEAR historical vegetation data were built."
+    )
+
+
+# ------------------------------------------------------------
+# FALL BACK TO YEAR-SPECIFIC FINAL_CDL SCENARIO EXPORTS
+# ------------------------------------------------------------
+#
+# Example:
+#   Corn_MODIS_2023_FINAL_CDL.csv
+#
+# If 2023 is NOT already covered by the canonical same-year files,
+# this is valid historical same-year final-CDL vegetation and can
+# fill that year.  If a canonical same_year export exists, it wins
+# and the FINAL_CDL scenario file is left only for Cell 18.
+# ------------------------------------------------------------
+
+canonical_hist_years = set(
+    pd.to_numeric(
+        same_year_gee_wide["year"],
+        errors="coerce",
+    )
+    .dropna()
+    .astype(int)
+    .unique()
+)
+
+fallback_wide_parts = []
+
+for fallback_path in final_cdl_historical_candidates:
+
+    fallback_name = os.path.basename(fallback_path)
+    match = re.search(
+        r"corn_modis_(20\d{2})_final_cdl",
+        fallback_name,
+        flags=re.IGNORECASE,
+    )
+
+    if match is None:
+        continue
+
+    fallback_year = int(match.group(1))
+
+    if fallback_year in canonical_hist_years:
+        print(
+            f"Skipping FINAL_CDL historical fallback for {fallback_year}: "
+            "canonical same-year vegetation already covers that year."
+        )
+        continue
+
+    print(
+        f"Using FINAL_CDL scenario export as historical same-year fallback for {fallback_year}: "
+        f"{fallback_name}"
+    )
+
+    fallback_wide = build_gee_wide(
+        [fallback_path],
+        label=f"FINAL_CDL HISTORICAL FALLBACK {fallback_year}",
+        force_year=fallback_year,
+    )
+
+    fallback_wide_parts.append(
+        fallback_wide
+    )
+    canonical_hist_years.add(
+        fallback_year
+    )
+
+if fallback_wide_parts:
+
+    same_year_gee_wide = pd.concat(
+        [same_year_gee_wide] + fallback_wide_parts,
+        ignore_index=True,
+        sort=False,
+    )
+
+    duplicate_hist = same_year_gee_wide.duplicated(
+        subset=["GEOID", "year"],
+        keep=False,
+    )
+
+    if duplicate_hist.any():
+        examples = (
+            same_year_gee_wide.loc[
+                duplicate_hist,
+                ["GEOID", "year"],
+            ]
+            .drop_duplicates()
+            .head(20)
+        )
+        raise ValueError(
+            "Historical vegetation contains duplicate county-years after FINAL_CDL fallback. "
+            f"Examples:\n{examples.to_string(index=False)}"
+        )
+
+    same_year_gee_wide = (
+        same_year_gee_wide
+        .sort_values(["GEOID", "year"])
+        .reset_index(drop=True)
     )
 
 
@@ -1320,101 +1485,55 @@ print(
 # No yield interpolation.
 # ============================================================
 
+# Build an explicit county × calendar-year grid before rolling. This makes
+# hist_5yr mean the previous FIVE CALENDAR YEARS, not merely the previous
+# five available rows. Missing annual yield remains missing; it is never
+# interpolated.
+_yield_min_year = int(yield_clean_df["year"].min())
+_yield_max_year = int(yield_clean_df["year"].max())
+_yield_fips = sorted(yield_clean_df["FIPS"].unique())
+
+_yield_full_index = pd.MultiIndex.from_product(
+    [
+        _yield_fips,
+        range(_yield_min_year, _yield_max_year + 1),
+    ],
+    names=["FIPS", "year"],
+)
+
 yield_features = (
-
     yield_clean_df
-
-    .copy()
-
-    .sort_values(
-        [
-            "FIPS",
-            "year"
-        ]
-    )
-
-    .reset_index(
-        drop=True
-    )
-
+    .set_index(["FIPS", "year"])
+    .reindex(_yield_full_index)
+    .reset_index()
+    .sort_values(["FIPS", "year"])
+    .reset_index(drop=True)
 )
 
-
-yield_features[
-    "hist_5yr"
-] = (
-
+yield_features["hist_5yr"] = (
     yield_features
-
-    .groupby(
-        "FIPS"
-    )[
-        "yield_bu_acre"
-    ]
-
+    .groupby("FIPS")["yield_bu_acre"]
     .transform(
-
-        lambda x:
-
-            x.shift(1)
-
-            .rolling(
-                5,
-                min_periods=5
-            )
-
-            .mean()
-
+        lambda x: x.shift(1).rolling(5, min_periods=5).mean()
     )
-
 )
 
-
-yield_features[
-    "hist_3yr"
-] = (
-
+yield_features["hist_3yr"] = (
     yield_features
-
-    .groupby(
-        "FIPS"
-    )[
-        "yield_bu_acre"
-    ]
-
+    .groupby("FIPS")["yield_bu_acre"]
     .transform(
-
-        lambda x:
-
-            x.shift(1)
-
-            .rolling(
-                3,
-                min_periods=3
-            )
-
-            .mean()
-
+        lambda x: x.shift(1).rolling(3, min_periods=3).mean()
     )
-
 )
 
-
-yield_features[
-    "yield_anomaly"
-] = (
-
-    yield_features[
-        "yield_bu_acre"
-    ]
-
-    -
-
-    yield_features[
-        "hist_5yr"
-    ]
-
+yield_features["yield_anomaly"] = (
+    yield_features["yield_bu_acre"]
+    - yield_features["hist_5yr"]
 )
+
+_missing_calendar_rows = int(yield_features["yield_bu_acre"].isna().sum())
+print("Calendar-complete yield grid:", yield_features.shape)
+print("Missing county-year yield cells retained as NaN:", _missing_calendar_rows)
 
 
 print(
@@ -2399,25 +2518,22 @@ print(
 
 
 if duplicate_count > 0:
+    duplicate_weather_examples = (
+        environment_raw.loc[
+            environment_raw.duplicated(
+                subset=["FIPS", "year", "DOY"],
+                keep=False
+            ),
+            ["FIPS", "year", "DOY"]
+        ]
+        .drop_duplicates()
+        .head(20)
+    )
 
-    environment_raw = (
-
-        environment_raw
-
-        .groupby(
-
-            [
-                "FIPS",
-                "year",
-                "DOY"
-            ],
-
-            as_index=False
-
-        )[RAW_SOURCE_VARS]
-
-        .mean()
-
+    raise ValueError(
+        "Duplicate FIPS-year-DOY PRISM rows detected. The audited workflow will NOT "
+        "silently average potentially different weather products. Remove overlapping "
+        f"PRISM inputs. First duplicate keys:\n{duplicate_weather_examples.to_string(index=False)}"
     )
 
 
@@ -2805,18 +2921,23 @@ def build_features(
         matrix,
         doys
     ):
+        """Interpolate only gaps bracketed by real observations.
+
+        np.interp normally clamps missing tails to the nearest observed value.
+        That silently fabricates early/late-season vegetation. Here, leading
+        and trailing gaps remain NaN and are handled later by the existing
+        training-only imputation policy.
+        """
 
         X = np.asarray(
             matrix,
             dtype=float
         ).copy()
 
-
         doys = np.asarray(
             doys,
             dtype=float
         )
-
 
         output = np.full_like(
             X,
@@ -2824,62 +2945,40 @@ def build_features(
             dtype=float
         )
 
-
-        for i in range(
-            X.shape[0]
-        ):
-
-
-            row = X[
-                i
-            ]
-
-
-            good = np.isfinite(
-                row
-            )
-
-
-            n_good = int(
-                good.sum()
-            )
-
+        for i in range(X.shape[0]):
+            row = X[i]
+            good = np.isfinite(row)
+            n_good = int(good.sum())
 
             if n_good == 0:
-
                 continue
-
 
             if n_good == 1:
-
-                output[
-                    i,
-                    :
-                ] = row[
-                    good
-                ][0]
-
-
+                # Preserve the one real observation only. Do not invent the
+                # rest of the season from a single value.
+                output[i, good] = row[good]
                 continue
 
+            x_good = doys[good]
+            y_good = row[good]
 
-            output[
-                i,
-                :
-            ] = np.interp(
+            # Defensive guard: DOY coordinates should already be unique after
+            # pivoting, but refuse to fit/interpolate ambiguous coordinates.
+            if np.unique(x_good).size < 2:
+                output[i, good] = row[good]
+                continue
 
-                doys,
-
-                doys[
-                    good
-                ],
-
-                row[
-                    good
-                ]
-
+            inside = (
+                (doys >= np.min(x_good))
+                &
+                (doys <= np.max(x_good))
             )
 
+            output[i, inside] = np.interp(
+                doys[inside],
+                x_good,
+                y_good
+            )
 
         return output
 
@@ -2971,19 +3070,20 @@ def build_features(
             return np.nan
 
 
-        return np.polyfit(
+        x_good = doys[good]
+        y_good = values[good]
 
-            doys[
-                good
-            ],
+        if np.unique(x_good).size < 2:
+            return np.nan
 
-            values[
-                good
-            ],
-
-            1
-
-        )[0]
+        try:
+            return np.polyfit(
+                x_good,
+                y_good,
+                1
+            )[0]
+        except (np.linalg.LinAlgError, ValueError, FloatingPointError):
+            return np.nan
 
 
     # ========================================================
@@ -3559,52 +3659,52 @@ def get_environment(
     rows,
     doy
 ):
+    """Return compact PRISM features and fail loudly on key misalignment."""
 
     keys = pd.MultiIndex.from_arrays(
-
         [
-
-            rows[
-                "FIPS"
-            ].astype(str),
-
-            rows[
-                "year"
-            ].astype(int),
-
-            np.full(
-                len(rows),
-                int(doy)
-            )
-
+            rows["FIPS"].astype(str),
+            rows["year"].astype(int),
+            np.full(len(rows), int(doy)),
         ],
-
-        names=[
-            "FIPS",
-            "year",
-            "DOY"
-        ]
-
+        names=["FIPS", "year", "DOY"]
     )
-
 
     X = (
-
         env_indexed
-
-        .reindex(
-            keys
-        )[
-            BASE_ENV
-        ]
-
+        .reindex(keys)[BASE_ENV]
         .copy()
-
     )
-
 
     X.index = rows.index
 
+    if len(X) == 0:
+        raise RuntimeError(
+            f"DOY {doy}: PRISM lookup returned zero rows."
+        )
+
+    fully_missing_features = X.columns[X.isna().all(axis=0)].tolist()
+    if fully_missing_features:
+        raise RuntimeError(
+            f"DOY {doy}: PRISM feature(s) are completely missing after key lookup: "
+            f"{fully_missing_features}. Check FIPS/year/DOY alignment and source files."
+        )
+
+    fully_missing_rows = X.isna().all(axis=1)
+    n_fully_missing_rows = int(fully_missing_rows.sum())
+    if n_fully_missing_rows > 0:
+        examples = rows.loc[fully_missing_rows, ["FIPS", "year"]].head(10)
+        raise RuntimeError(
+            f"DOY {doy}: {n_fully_missing_rows} requested county-year rows have NO PRISM "
+            f"features. Example keys:\n{examples.to_string(index=False)}"
+        )
+
+    overall_coverage = float(X.notna().mean().mean())
+    if overall_coverage < 0.99:
+        warnings.warn(
+            f"DOY {doy}: PRISM cell coverage is {overall_coverage:.2%}. "
+            "Scattered missing values will use training-only median imputation."
+        )
 
     return X
 
@@ -3937,18 +4037,70 @@ available_years = sorted(
 )
 
 
-TEST_YEARS = [
+REQUESTED_TEST_YEARS = list(
+    range(VALIDATION_START_YEAR, VALIDATION_END_YEAR + 1)
+)
 
+missing_requested_test_years = [
     y
+    for y in REQUESTED_TEST_YEARS
+    if y not in available_years
+]
 
-    for y in range(
-        2018,
-        2023
+if missing_requested_test_years:
+
+    print("\n" + "=" * 90)
+    print("REQUESTED-YEAR INPUT DIAGNOSTIC")
+    print("=" * 90)
+
+    veg_years_pre_filter = set(
+        pd.to_numeric(
+            same_year_cdl_df["year"],
+            errors="coerce",
+        )
+        .dropna()
+        .astype(int)
+        .unique()
     )
 
-    if y in available_years
+    yield_years_available = set(
+        pd.to_numeric(
+            yield_clean_df["year"],
+            errors="coerce",
+        )
+        .dropna()
+        .astype(int)
+        .unique()
+    )
 
-]
+    hist_counts_by_year = (
+        yield_features
+        .groupby("year")["hist_5yr"]
+        .apply(lambda s: int(s.notna().sum()))
+        .to_dict()
+    )
+
+    for diagnostic_year in REQUESTED_TEST_YEARS:
+        print(
+            f"{diagnostic_year}: "
+            f"MODIS={'YES' if diagnostic_year in veg_years_pre_filter else 'NO'} | "
+            f"yield={'YES' if diagnostic_year in yield_years_available else 'NO'} | "
+            f"hist_5yr rows={hist_counts_by_year.get(diagnostic_year, 0)} | "
+            f"final model={'YES' if diagnostic_year in available_years else 'NO'}"
+        )
+
+    print("=" * 90)
+
+    raise RuntimeError(
+        "Requested held-out validation years are missing from the final model table: "
+        f"{missing_requested_test_years}. The diagnostic above shows whether each year is "
+        "missing SAME-YEAR/FINAL-CDL MODIS, observed yield, or a valid 5-calendar-year baseline. "
+        "PRISM is checked separately later when model matrices are built."
+    )
+
+TEST_YEARS = list(
+    REQUESTED_TEST_YEARS
+)
 
 
 print(
@@ -3994,13 +4146,17 @@ for doy in DOY_LIST:
         ].copy()
 
 
-        if (
-            len(train_rows) == 0
-            or
-            len(test_rows) == 0
-        ):
+        if len(train_rows) == 0:
+            raise RuntimeError(
+                f"Held-out {test_year}, DOY {doy}: zero training rows. "
+                "Check historical coverage and hist_5yr construction."
+            )
 
-            continue
+        if len(test_rows) == 0:
+            raise RuntimeError(
+                f"Held-out {test_year}, DOY {doy}: zero test rows. "
+                "Check yield/MODIS/PRISM coverage."
+            )
 
 
         X_train, X_test = build_model_matrices(
@@ -4121,6 +4277,26 @@ seasonal_results_df = pd.DataFrame(
     seasonal_results
 )
 
+_expected_validation_pairs = {
+    (year, doy)
+    for year in TEST_YEARS
+    for doy in DOY_LIST
+}
+_produced_validation_pairs = set(
+    zip(
+        seasonal_results_df["TestYear"],
+        seasonal_results_df["DOY"]
+    )
+)
+_missing_validation_pairs = sorted(
+    _expected_validation_pairs - _produced_validation_pairs
+)
+
+if _missing_validation_pairs:
+    raise RuntimeError(
+        "Historical validation did not produce every requested year×DOY pair. "
+        f"Missing first 20: {_missing_validation_pairs[:20]}"
+    )
 
 print(
     "\n✓ historical seasonal validation complete"
@@ -4175,6 +4351,29 @@ seasonal_summary = (
 display(
     seasonal_summary
 )
+
+
+# Save the complete held-out validation grid and seasonal summary.
+seasonal_results_path = os.path.join(
+    OUTPUT_DIR_BASE,
+    f"CY2_V2_AUDITED_heldout_{VALIDATION_TAG}_all_DOYs.csv"
+)
+seasonal_summary_path = os.path.join(
+    OUTPUT_DIR_BASE,
+    f"CY2_V2_AUDITED_heldout_{VALIDATION_TAG}_seasonal_summary.csv"
+)
+
+seasonal_results_df.to_csv(
+    seasonal_results_path,
+    index=False
+)
+seasonal_summary.to_csv(
+    seasonal_summary_path,
+    index=False
+)
+
+print("✓ held-out validation results saved:", seasonal_results_path)
+print("✓ seasonal summary saved:", seasonal_summary_path)
 
 
 plt.figure(
@@ -4357,7 +4556,7 @@ print(
 )
 
 
-# CELL 18 — 2022/2023 ICDL DEPLOYMENT TEST
+# CELL 18 — REQUESTED-YEAR ICDL DEPLOYMENT TEST (WHERE SCENARIOS EXIST)
 #
 # PURPOSE
 # -------
@@ -4376,8 +4575,7 @@ print(
 #
 # IMPORTANT
 # ---------
-# • 2022 model trains ONLY on years < 2022.
-# • 2023 model trains ONLY on years < 2023.
+# • Each test year trains ONLY on historical years < that test year.
 # • Test-year vegetation NEVER enters its anomaly baseline.
 # • XGBoost is trained ONCE per year/DOY.
 # • Training feature columns + medians are frozen before testing.
@@ -4481,56 +4679,44 @@ print(
 # 2. SETTINGS
 # ============================================================
 
-TEST_YEARS_CELL18 = [
-
-    2022,
-
-    2023
-
-]
+TEST_YEARS_CELL18 = list(
+    REQUESTED_TEST_YEARS
+)
 
 
 # ------------------------------------------------------------
-# Our operational mask timing.
+# STRICT CAUSAL MONTH-END ICDL TIMING
+# ------------------------------------------------------------
+# Our clean monthly ICDLs are built using imagery through:
+#   June 30, July 31, August 31.
+# Therefore a mask is first eligible at the NEXT standard model checkpoint.
 #
-# June mask:
-#   DOY 161, 177
+# Standard non-leap-year checkpoint dates are approximately:
+#   DOY 161 = Jun 10
+#   DOY 177 = Jun 26
+#   DOY 193 = Jul 12  -> June ICDL is available
+#   DOY 209 = Jul 28  -> June ICDL
+#   DOY 225 = Aug 13  -> July ICDL is available
+#   DOY 241 = Aug 29  -> July ICDL
+#   DOY 257 = Sep 14  -> August ICDL is available
+#   DOY 273 = Sep 30  -> August ICDL
 #
-# July:
-#   193, 209
-#
-# August:
-#   225 onward
-#
-# Therefore, right now 2022 June gives us TWO valid
-# operational checkpoints while July/August finish.
+# This prevents use of a month-end crop mask before that month has ended.
 # ------------------------------------------------------------
 
 CHECKPOINT_DOYS = {
-
     "June": [
-
-        161,
-        177
-
-    ],
-
-    "July": [
-
         193,
-        209
-
+        209,
     ],
-
-    "August": [
-
+    "July": [
         225,
         241,
+    ],
+    "August": [
         257,
-        273
-
-    ]
-
+        273,
+    ],
 }
 
 
@@ -4538,7 +4724,7 @@ SCENARIO_DIR = DATA_DIR
 
 OUTPUT_DIR_CELL18 = os.path.join(
     OUTPUT_DIR_BASE,
-    "cell18_2022_2023_icdl_results",
+    f"cell18_{VALIDATION_TAG}_icdl_results",
 )
 
 os.makedirs(
@@ -4567,7 +4753,7 @@ os.makedirs(
 #   Corn_MODIS_2022_STUDY_JULY.csv
 #   Corn_MODIS_2022_STUDY_AUGUST.csv
 #
-# and the equivalent 2023 files.
+# and equivalent files for any requested validation year.
 # ============================================================
 # 4. FIND SCENARIO FILES
 #
@@ -4692,7 +4878,7 @@ def parse_scenario_file(
 
     pattern = re.compile(
 
-        r"^CORN_MODIS_(2022|2023)_"
+        r"^CORN_MODIS_(20\d{2})_"
 
         r"(PREVIOUS_CDL|FINAL_CDL|"
 
@@ -4722,6 +4908,9 @@ def parse_scenario_file(
     year = int(
         match.group(1)
     )
+
+    if year not in TEST_YEARS_CELL18:
+        return None
 
 
     token = (
@@ -4924,11 +5113,19 @@ for path in all_scenario_csvs:
 
 
     if parsed is not None:
-
-
         parsed_candidates.append(
             parsed
         )
+    else:
+        normalized = normalize_filename(path)
+        if normalized.startswith("CORN_MODIS_") and any(
+            str(y) in normalized
+            for y in TEST_YEARS_CELL18
+        ):
+            print(
+                "WARNING: Unrecognized scenario filename:",
+                os.path.basename(path)
+            )
 
 
 if len(
@@ -4938,7 +5135,7 @@ if len(
 
     raise FileNotFoundError(
 
-        "No 2022/2023 scenario CSVs were detected."
+        "No recognized ICDL scenario CSVs were detected for the requested validation years."
 
     )
 
@@ -6204,6 +6401,7 @@ def build_frozen_test_matrix_cell18(
 # ============================================================
 
 results_cell18_icdl = []
+prediction_rows_cell18 = []
 
 
 print()
@@ -6213,7 +6411,7 @@ print(
 )
 
 print(
-    "RUNNING 2022 / 2023 ICDL DEPLOYMENT TEST"
+    "RUNNING REQUESTED-YEAR ICDL DEPLOYMENT TEST (AVAILABLE SCENARIOS)"
 )
 
 print(
@@ -6597,6 +6795,19 @@ for test_year in TEST_YEARS_CELL18:
                     "yield_bu_acre"
                 ].to_numpy()
 
+            )
+
+
+            prediction_rows_cell18.append(
+                pd.DataFrame({
+                    "FIPS": test_rows["FIPS"].to_numpy(),
+                    "Test_Year": int(test_year),
+                    "DOY": int(doy),
+                    "Scenario": result_label,
+                    "Source_File_Scenario": source_label,
+                    "Actual_Yield": actual_yield,
+                    "Predicted_Yield": predicted_yield,
+                })
             )
 
 
@@ -7234,7 +7445,7 @@ print(
 )
 
 print(
-    "JUNE COMPARISON — 2022 VS 2023"
+    "JUNE ICDL COMPARISON — FIRST USABLE DOYS AFTER JUNE 30"
 )
 
 print(
@@ -7261,7 +7472,7 @@ results_path_cell18 = os.path.join(
 
     OUTPUT_DIR_CELL18,
 
-    "cell18_2022_2023_icdl_all_results.csv"
+    f"cell18_{VALIDATION_TAG}_icdl_all_results.csv"
 
 )
 
@@ -7270,7 +7481,7 @@ table_path_cell18 = os.path.join(
 
     OUTPUT_DIR_CELL18,
 
-    "cell18_2022_2023_icdl_R2_table.csv"
+    f"cell18_{VALIDATION_TAG}_icdl_R2_table.csv"
 
 )
 
@@ -7279,7 +7490,7 @@ june_path_cell18 = os.path.join(
 
     OUTPUT_DIR_CELL18,
 
-    "cell18_JUNE_2022_vs_2023.csv"
+    "cell18_JUNE_ICDL_comparison.csv"
 
 )
 
@@ -7369,11 +7580,295 @@ print(
 
 print(
     """
-WHEN NEW 2022 SCENARIO CSVs FINISH:
+WHEN NEW SCENARIO CSVs FINISH:
 
   place them under --input-dir and rerun this script.
 
-The deployment comparison will automatically expand when the
-new July/August CLEAN_REBUILT or STUDY files are present.
+The deployment comparison will automatically expand when additional
+recognized PREVIOUS_CDL / CLEAN_REBUILT / STUDY / FINAL_CDL files are present.
 """
 )
+
+
+# ============================================================
+# CELL 19 — J-STYLE FORECAST-ENCOMPASSING TEST
+# ============================================================
+#
+# PURPOSE
+# -------
+# Compare paired OUT-OF-SAMPLE county predictions from:
+#
+#   A = Previous-year CDL
+#   B = Our Clean Operational ICDL
+#
+# for each available requested test-year × operational DOY.
+#
+# This is intentionally described as a J-STYLE forecast-encompassing test.
+# The classical Davidson–MacKinnon J test was derived for non-nested
+# parametric regression specifications. Here the objects being compared are
+# XGBoost forecasts produced from different crop-mask scenarios.
+#
+# Direction A:
+#   actual = b0 + b1 * pred_A + b2 * pred_B + error
+#   test H0: b2 = 0  (does B add information beyond A?)
+#
+# Direction B:
+#   actual = c0 + c1 * pred_B + c2 * pred_A + error
+#   test H0: c2 = 0  (does A add information beyond B?)
+#
+# HC1 heteroskedasticity-robust standard errors are used.
+# ============================================================
+
+
+def _ols_hc1_added_prediction_test(y, primary_pred, added_pred):
+    """OLS coefficient test for the added forecast with HC1 robust SE."""
+
+    y = np.asarray(y, dtype=float)
+    p1 = np.asarray(primary_pred, dtype=float)
+    p2 = np.asarray(added_pred, dtype=float)
+
+    finite = np.isfinite(y) & np.isfinite(p1) & np.isfinite(p2)
+    y = y[finite]
+    p1 = p1[finite]
+    p2 = p2[finite]
+
+    n = len(y)
+    X = np.column_stack([np.ones(n), p1, p2])
+    k = X.shape[1]
+
+    if n <= k + 1:
+        return {
+            "n_obs": n,
+            "coef_added": np.nan,
+            "se_added": np.nan,
+            "t_added": np.nan,
+            "p_added": np.nan,
+            "condition_number": np.nan,
+        }
+
+    xtx_inv = np.linalg.pinv(X.T @ X)
+    beta = xtx_inv @ X.T @ y
+    residual = y - X @ beta
+
+    # HC1 sandwich covariance.
+    xu = X * residual[:, None]
+    meat = xu.T @ xu
+    hc1_scale = n / (n - k)
+    cov_hc1 = hc1_scale * (xtx_inv @ meat @ xtx_inv)
+
+    variance_added = float(cov_hc1[2, 2])
+    se_added = np.sqrt(max(variance_added, 0.0))
+
+    if not np.isfinite(se_added) or se_added <= 0:
+        t_added = np.nan
+        p_added = np.nan
+    else:
+        t_added = float(beta[2] / se_added)
+        p_added = float(
+            2.0 * stats.t.sf(
+                abs(t_added),
+                df=n - k
+            )
+        )
+
+    return {
+        "n_obs": n,
+        "coef_added": float(beta[2]),
+        "se_added": float(se_added),
+        "t_added": t_added,
+        "p_added": p_added,
+        "condition_number": float(np.linalg.cond(X)),
+    }
+
+
+def davidson_mackinnon_jstyle(
+    y_true,
+    y_pred_a,
+    y_pred_b,
+    label_a="Previous-year CDL",
+    label_b="Our Clean Operational",
+    alpha=0.05,
+):
+    """Two-direction J-style forecast-encompassing comparison."""
+
+    b_adds_to_a = _ols_hc1_added_prediction_test(
+        y_true,
+        y_pred_a,
+        y_pred_b,
+    )
+
+    a_adds_to_b = _ols_hc1_added_prediction_test(
+        y_true,
+        y_pred_b,
+        y_pred_a,
+    )
+
+    p_b = b_adds_to_a["p_added"]
+    p_a = a_adds_to_b["p_added"]
+
+    reject_a = bool(np.isfinite(p_b) and p_b < alpha)
+    reject_b = bool(np.isfinite(p_a) and p_a < alpha)
+
+    if reject_a and not reject_b:
+        interpretation = f"{label_b} adds information beyond {label_a}"
+    elif reject_b and not reject_a:
+        interpretation = f"{label_a} adds information beyond {label_b}"
+    elif reject_a and reject_b:
+        interpretation = "Both forecasts add statistically detectable information"
+    else:
+        interpretation = "Neither forecast adds statistically detectable information beyond the other"
+
+    return {
+        "N": b_adds_to_a["n_obs"],
+        "Coef_B_added_to_A": b_adds_to_a["coef_added"],
+        "SE_B_added_to_A_HC1": b_adds_to_a["se_added"],
+        "t_B_added_to_A": b_adds_to_a["t_added"],
+        "p_B_added_to_A": b_adds_to_a["p_added"],
+        "Reject_A_as_encompassing": reject_a,
+        "Coef_A_added_to_B": a_adds_to_b["coef_added"],
+        "SE_A_added_to_B_HC1": a_adds_to_b["se_added"],
+        "t_A_added_to_B": a_adds_to_b["t_added"],
+        "p_A_added_to_B": a_adds_to_b["p_added"],
+        "Reject_B_as_encompassing": reject_b,
+        "Condition_Number_AplusB": b_adds_to_a["condition_number"],
+        "Interpretation": interpretation,
+    }
+
+
+print()
+print("=" * 105)
+print("CELL 19 — J-STYLE FORECAST-ENCOMPASSING TEST")
+print("=" * 105)
+
+if len(prediction_rows_cell18) == 0:
+    print("No Cell 18 county predictions exist; J-style test skipped.")
+else:
+    predictions_cell18_df = pd.concat(
+        prediction_rows_cell18,
+        ignore_index=True,
+    )
+
+    jtest_rows = []
+
+    grouped_keys = (
+        predictions_cell18_df[["Test_Year", "DOY"]]
+        .drop_duplicates()
+        .sort_values(["Test_Year", "DOY"])
+        .itertuples(index=False, name=None)
+    )
+
+    for test_year, doy in grouped_keys:
+        if int(test_year) not in TEST_YEARS_CELL18:
+            continue
+
+        group = predictions_cell18_df[
+            (predictions_cell18_df["Test_Year"] == test_year)
+            &
+            (predictions_cell18_df["DOY"] == doy)
+        ].copy()
+
+        prev = group[
+            group["Scenario"] == "Previous-year CDL"
+        ][
+            ["FIPS", "Actual_Yield", "Predicted_Yield"]
+        ].rename(
+            columns={"Predicted_Yield": "Pred_Previous"}
+        )
+
+        our = group[
+            group["Scenario"] == "Our Clean Operational"
+        ][
+            ["FIPS", "Actual_Yield", "Predicted_Yield"]
+        ].rename(
+            columns={"Predicted_Yield": "Pred_Our_ICDL"}
+        )
+
+        if prev.empty or our.empty:
+            continue
+
+        paired = prev.merge(
+            our[["FIPS", "Pred_Our_ICDL"]],
+            on="FIPS",
+            how="inner",
+            validate="one_to_one",
+        ).dropna()
+
+        if len(paired) < 10:
+            print(
+                f"{test_year} DOY {doy}: J-style test skipped — only "
+                f"{len(paired)} paired counties."
+            )
+            continue
+
+        j = davidson_mackinnon_jstyle(
+            y_true=paired["Actual_Yield"],
+            y_pred_a=paired["Pred_Previous"],
+            y_pred_b=paired["Pred_Our_ICDL"],
+        )
+
+        jtest_rows.append({
+            "Test_Year": int(test_year),
+            "DOY": int(doy),
+            **j,
+        })
+
+        print(
+            f"{int(test_year)} | DOY {int(doy):03d} | "
+            f"p(ICDL adds to previous)={j['p_B_added_to_A']:.4g} | "
+            f"p(previous adds to ICDL)={j['p_A_added_to_B']:.4g} | "
+            f"{j['Interpretation']}"
+        )
+
+    jtest_results_df = pd.DataFrame(jtest_rows)
+
+    prediction_path = os.path.join(
+        OUTPUT_DIR_CELL18,
+        "cell18_county_predictions_for_Jtest.csv",
+    )
+    predictions_cell18_df.to_csv(
+        prediction_path,
+        index=False,
+    )
+    print("\n✓ County prediction pairs saved:")
+    print(prediction_path)
+
+    if jtest_results_df.empty:
+        print(
+            "No paired Previous-year CDL vs Our Clean Operational forecasts were "
+            "available for the requested validation years."
+        )
+    else:
+        jtest_path = os.path.join(
+            OUTPUT_DIR_CELL18,
+            f"Davidson_MacKinnon_JStyle_{VALIDATION_TAG}_by_year_DOY.csv",
+        )
+
+        jtest_results_df.to_csv(
+            jtest_path,
+            index=False,
+        )
+
+        print("\n✓ J-style forecast-encompassing results saved:")
+        print(jtest_path)
+        print()
+        display(jtest_results_df.round(6))
+
+
+# ============================================================
+# FINAL AUDIT SUMMARY
+# ============================================================
+print()
+print("=" * 105)
+print("CY2 V2 AUDITED WORKFLOW COMPLETE")
+print("=" * 105)
+print("Model version:", MODEL_VERSION)
+print("Held-out validation years:", TEST_YEARS)
+print("Key hardening changes:")
+print("  ✓ calendar-complete hist_5yr / hist_3yr")
+print("  ✓ internal-only vegetation interpolation; no flat tail extrapolation")
+print("  ✓ duplicate-DOY slope guard")
+print("  ✓ strict PRISM key/coverage checks before imputation")
+print("  ✓ targeted CSV/ZIP input traversal")
+print("  ✓ generalized requested-year scenario parser")
+print("  ✓ strict month-end causal ICDL availability schedule")
+print("  ✓ paired J-style forecast-encompassing test with HC1 robust SE")
