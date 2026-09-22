@@ -1,0 +1,6532 @@
+# ============================================================
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+CORN YIELD 2 — Canonical compact-PRISM yield model
+
+This script replaces the former notebook Cells 1–18 and is the canonical
+saved yield-model workflow after feature ablation.
+
+FINAL PRODUCTION FEATURE POLICY
+-------------------------------
+KEEP:
+  • Raw MODIS vegetation features
+  • Leakage-free historical vegetation-anomaly features
+  • hist_5yr
+  • year
+  • 15 compact raw PRISM weather features
+
+REMOVE FROM THE MAIN MODEL:
+  • PRISM weather-anomaly features
+  • SoilGrids AWC100
+  • AWC × weather-stress interactions
+  • SOC
+  • CEC
+  • LST
+
+Historical model training uses SAME-YEAR FINAL CDL vegetation masks.
+Held-out operational ICDL comparisons still use the scenario masks supplied
+for the forecast year, so crop-mask quality can be tested fairly.
+
+Workflow:
+  1. Discover/stage CSV and ZIP inputs.
+  2. Build SAME-YEAR historical MODIS vegetation tables.
+  3. Merge real county yield and leakage-free hist_5yr.
+  4. Build leakage-free historical vegetation anomalies.
+  5. Build the 15-variable compact raw PRISM block.
+  6. Build season-to-date vegetation features.
+  7. Fit the fixed XGBoost anomaly model with hist_5yr + year.
+  8. Run expanding-year seasonal validation.
+  9. Run the 2022/2023 ICDL deployment comparison using the SAME model spec.
+
+Local usage:
+    python CY2_COMPACT_PRISM_CDL_ICDL_2022_2025_JTEST.py ^
+        --input-dir "C:\\Users\\Patron\\Downloads\\Author's ICDL" ^
+        --work-dir "C:\\Users\\Patron\\Downloads\\Author's ICDL\\10_MODEL_WORK" ^
+        --output-dir "C:\\Users\\Patron\\Downloads\\Author's ICDL\\11_MODEL_RESULTS"
+
+The input directory may contain CSV files directly and/or ZIP archives.
+ZIP archives are extracted into the work directory. Source inputs are not
+modified.
+
+Dependencies:
+    numpy pandas matplotlib scikit-learn xgboost
+"""
+
+# ============================================================
+# CELL 1 — IMPORTS + COMMAND-LINE SETTINGS
+# ============================================================
+
+import argparse
+import os
+import glob
+import zipfile
+import shutil
+import warnings
+import re
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.metrics import (
+    r2_score,
+    mean_squared_error,
+    mean_absolute_error,
+)
+
+from xgboost import XGBRegressor
+
+try:
+    from IPython.display import display
+except Exception:
+    def display(obj):
+        print(obj)
+
+warnings.filterwarnings("ignore")
+
+pd.set_option("display.max_columns", 250)
+pd.set_option("display.width", 240)
+
+
+
+MODEL_VERSION = "CY2_COMPACT_PRISM_CANONICAL_V1_with_j-test"
+
+# The fixed model configuration selected by the controlled ablation.
+XGB_PARAMS = {
+    "n_estimators": 500,
+    "max_depth": 5,
+    "learning_rate": 0.04,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "objective": "reg:squarederror",
+    "tree_method": "hist",
+    "n_jobs": -1,
+}
+
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Corn Yield 2 — canonical compact-PRISM yield-model workflow"
+    )
+
+    parser.add_argument(
+        "--input-dir",
+        default=r"C:\Users\Patron\Downloads\Author's ICDL",
+        help="Directory containing required CSVs and/or ZIP archives.",
+    )
+
+    parser.add_argument(
+        "--work-dir",
+        default=r"C:\Users\Patron\Downloads\Author's ICDL\10_MODEL_WORK",
+        help="Scratch directory used for extracted/staged inputs.",
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        default=r"C:\Users\Patron\Downloads\Author's ICDL\11_MODEL_RESULTS",
+        help="Directory for validation and ICDL result files.",
+    )
+
+    return parser.parse_args()
+
+
+ARGS = parse_args()
+
+INPUT_DIR = os.path.abspath(ARGS.input_dir)
+WORK_DIR = os.path.abspath(ARGS.work_dir)
+OUTPUT_DIR_BASE = os.path.abspath(ARGS.output_dir)
+
+print("✓ imports ready")
+print("Input directory :", INPUT_DIR)
+print("Work directory  :", WORK_DIR)
+print("Output directory:", OUTPUT_DIR_BASE)
+
+print("Model version    :", MODEL_VERSION)
+print("Feature policy   : vegetation + veg anomalies + hist_5yr + year + 15 compact PRISM")
+# ============================================================
+# CELL 2 — DISCOVER + STAGE INPUT FILES
+# ============================================================
+
+if not os.path.isdir(INPUT_DIR):
+    raise FileNotFoundError(
+        f"Input directory does not exist:\n{INPUT_DIR}"
+    )
+
+DATA_DIR = os.path.join(WORK_DIR, "data")
+
+# Snapshot source files BEFORE recreating the work directory. This also
+# prevents accidental recursive discovery when work/output live below
+# the input directory.
+source_csvs = []
+source_zips = []
+
+work_resolved = Path(WORK_DIR).resolve()
+output_resolved = Path(OUTPUT_DIR_BASE).resolve()
+
+for path in Path(INPUT_DIR).rglob("*"):
+    if not path.is_file():
+        continue
+
+    resolved = path.resolve()
+
+    # Never re-ingest our own work or result directories.
+    try:
+        resolved.relative_to(work_resolved)
+        continue
+    except ValueError:
+        pass
+
+    try:
+        resolved.relative_to(output_resolved)
+        continue
+    except ValueError:
+        pass
+
+    suffix = path.suffix.lower()
+
+    if suffix == ".csv":
+        source_csvs.append(path)
+
+    elif suffix == ".zip":
+        source_zips.append(path)
+
+
+print("\nSource CSV files:", len(source_csvs))
+print("Source ZIP files:", len(source_zips))
+
+if len(source_csvs) == 0 and len(source_zips) == 0:
+    raise FileNotFoundError(
+        "No CSV or ZIP inputs were found under:\n"
+        + INPUT_DIR
+    )
+
+
+if os.path.exists(DATA_DIR):
+    shutil.rmtree(DATA_DIR)
+
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR_BASE, exist_ok=True)
+
+
+# ------------------------------------------------------------
+# Copy direct CSV inputs while preserving their relative paths.
+# ------------------------------------------------------------
+for src in source_csvs:
+
+    rel = src.relative_to(Path(INPUT_DIR))
+    dst = Path(DATA_DIR) / "direct_csv" / rel
+
+    dst.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    shutil.copy2(
+        src,
+        dst,
+    )
+
+
+# ------------------------------------------------------------
+# Extract every ZIP into its own subdirectory so identically
+# named files from different archives cannot overwrite each other.
+# ------------------------------------------------------------
+for n, src in enumerate(
+    sorted(source_zips),
+    start=1,
+):
+
+    safe_name = re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "_",
+        src.stem,
+    )
+
+    extract_dir = (
+        Path(DATA_DIR)
+        / "zip_extract"
+        / f"{n:03d}_{safe_name}"
+    )
+
+    extract_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    print(
+        "Extracting:",
+        src.name,
+    )
+
+    with zipfile.ZipFile(
+        src,
+        "r",
+    ) as z:
+
+        z.extractall(
+            extract_dir
+        )
+
+
+all_csvs = glob.glob(
+    DATA_DIR + "/**/*.csv",
+    recursive=True,
+)
+
+
+print(
+    "\nTotal staged CSV files:",
+    len(all_csvs),
+)
+
+
+for f in sorted(all_csvs)[:50]:
+
+    print(
+        " ",
+        os.path.basename(f),
+    )
+# CELL 3 — CLASSIFY INPUT FILES
+# ============================================================
+
+same_year_csvs = []
+prism_csvs = []
+yield_candidates = []
+
+
+for f in all_csvs:
+
+    name = os.path.basename(f)
+    lower = name.lower()
+
+    # ========================================================
+    # SAME-YEAR HISTORICAL MODIS
+    # ========================================================
+
+    if "corn_modis_same_year" in lower:
+
+        same_year_csvs.append(
+            f
+        )
+
+        continue
+
+
+    # ========================================================
+    # RAW PRISM WEATHER
+    # ========================================================
+
+    if (
+        "prism" in lower
+        or
+        "cornbelt_prism_weather" in lower
+    ):
+
+        prism_csvs.append(
+            f
+        )
+
+        continue
+
+
+    # ========================================================
+    # COUNTY YIELD
+    # ========================================================
+
+    if (
+        "yield" in lower
+        and
+        "modis" not in lower
+        and
+        "prism" not in lower
+        and
+        "weather" not in lower
+        and
+        "fixed_data" not in lower
+    ):
+
+        yield_candidates.append(
+            f
+        )
+
+
+same_year_csvs = sorted(
+    same_year_csvs
+)
+
+prism_csvs = sorted(
+    prism_csvs
+)
+
+yield_candidates = sorted(
+    yield_candidates
+)
+
+
+# ============================================================
+# DUPLICATE-DOWNLOAD PROTECTION
+# ============================================================
+
+def _normalized_download_name(path):
+
+    name = os.path.basename(path)
+    stem, ext = os.path.splitext(name)
+
+    # Browser duplicates:
+    #   file.csv
+    #   file (1).csv
+    #   file (2).csv
+    stem = re.sub(
+        r"\s*\(\d+\)$",
+        "",
+        stem,
+    )
+
+    return (
+        stem.lower()
+        +
+        ext.lower()
+    )
+
+
+def _dedupe_file_list(paths):
+
+    groups = {}
+
+    for path in paths:
+
+        groups.setdefault(
+            _normalized_download_name(path),
+            [],
+        ).append(path)
+
+
+    chosen = []
+
+    for copies in groups.values():
+
+        chosen.append(
+            max(
+                copies,
+                key=os.path.getmtime,
+            )
+        )
+
+
+    return sorted(
+        chosen
+    )
+
+
+same_year_csvs = _dedupe_file_list(
+    same_year_csvs
+)
+
+prism_csvs = _dedupe_file_list(
+    prism_csvs
+)
+
+yield_candidates = _dedupe_file_list(
+    yield_candidates
+)
+
+
+print(
+    "\n" + "=" * 75
+)
+
+print(
+    "CANONICAL MODEL INPUTS"
+)
+
+print(
+    "=" * 75
+)
+
+print(
+    "Same-year historical MODIS:",
+    len(
+        same_year_csvs
+    )
+)
+
+print(
+    "PRISM weather files:",
+    len(
+        prism_csvs
+    )
+)
+
+print(
+    "Yield candidates:",
+    len(
+        yield_candidates
+    )
+)
+
+print(
+    "=" * 75
+)
+
+
+print(
+    "\nSame-year files:"
+)
+
+for f in same_year_csvs:
+
+    print(
+        " ",
+        os.path.basename(f)
+    )
+
+
+print(
+    "\nPRISM files:"
+)
+
+for f in prism_csvs:
+
+    print(
+        " ",
+        os.path.basename(f)
+    )
+
+# CELL 4 — BUILD GEE WIDE TABLE
+# ============================================================
+
+VEG_INDICES = [
+
+    "NDVI",
+    "EVI_scaled",
+    "EVI2",
+    "NDMI",
+    "NDWI",
+    "NIRv",
+    "GCI"
+
+]
+
+
+def clean_fips(
+    series
+):
+
+    return (
+        series
+        .astype(str)
+        .str.replace(
+            r"\.0$",
+            "",
+            regex=True
+        )
+        .str.zfill(5)
+    )
+
+
+def build_gee_wide(
+    csv_list,
+    label="GEE",
+    force_year=None
+):
+
+    dfs = []
+
+
+    if len(csv_list) == 0:
+
+        print(
+            f"⚠ No files for {label}"
+        )
+
+        return pd.DataFrame()
+
+
+    for f in csv_list:
+
+        print(
+            "Loading:",
+            os.path.basename(f)
+        )
+
+
+        df = pd.read_csv(
+            f,
+            low_memory=False
+        )
+
+
+        df.columns = [
+
+            c.strip()
+
+            for c in df.columns
+
+        ]
+
+
+        # ====================================================
+        # CROPSMART SCHEMA NORMALIZATION
+        # ----------------------------------------------------
+        # CropSmart in-season files use CS_-prefixed veg columns
+        # (CS_NDVI, CS_EVI, CS_EVI2, CS_NIRv, CS_GCI, CS_NDMI,
+        # CS_NDWI). Rename them to the model's names. Six indices
+        # are already on the CDL/training scale; only NDVI arrives
+        # already scaled to 0-1 and must be put back on the raw
+        # MODIS integer scale (x10000) the model was trained on.
+        # Only CropSmart-schema files are touched.
+        # ====================================================
+
+        _cs_map = {
+            "CS_NDVI": "NDVI",
+            "CS_EVI": "EVI_scaled",
+            "CS_EVI2": "EVI2",
+            "CS_NIRv": "NIRv",
+            "CS_GCI": "GCI",
+            "CS_NDMI": "NDMI",
+            "CS_NDWI": "NDWI",
+        }
+
+        if any(c in df.columns for c in _cs_map):
+
+            df = df.rename(
+                columns={
+                    k: v
+                    for k, v in _cs_map.items()
+                    if k in df.columns
+                }
+            )
+
+            # NDVI: CropSmart is 0-1, training NDVI is raw x10000.
+            if "NDVI" in df.columns:
+                df["NDVI"] = (
+                    pd.to_numeric(df["NDVI"], errors="coerce")
+                    * 10000.0
+                )
+
+            print(
+                "  CropSmart schema normalized "
+                "(CS_ -> model names; NDVI x10000):",
+                os.path.basename(f),
+            )
+
+
+        # ====================================================
+        # COUNTY ID
+        # ====================================================
+
+        if "GEOID" not in df.columns:
+
+            if "FIPS" in df.columns:
+
+                df = df.rename(
+                    columns={
+                        "FIPS":
+                            "GEOID"
+                    }
+                )
+
+            else:
+
+                print(
+                    "Skipping — no GEOID/FIPS:",
+                    os.path.basename(f)
+                )
+
+                continue
+
+
+        # ====================================================
+        # YEAR
+        # ====================================================
+
+        if "year" not in df.columns:
+
+            if force_year is not None:
+
+                df[
+                    "year"
+                ] = force_year
+
+            else:
+
+                raise KeyError(
+                    f"{os.path.basename(f)} has no year."
+                )
+
+
+        # ====================================================
+        # REQUIRED
+        # ====================================================
+
+        needed = [
+
+            "GEOID",
+            "date",
+            "year"
+
+        ] + VEG_INDICES
+
+
+        missing = [
+
+            c
+
+            for c in needed
+
+            if c not in df.columns
+
+        ]
+
+
+        if len(missing) > 0:
+
+            print(
+                "Skipping:",
+                os.path.basename(f)
+            )
+
+            print(
+                "Missing:",
+                missing
+            )
+
+            continue
+
+
+        df = df[
+            needed
+        ].copy()
+
+
+        # ====================================================
+        # TYPES
+        # ====================================================
+
+        df[
+            "GEOID"
+        ] = clean_fips(
+            df[
+                "GEOID"
+            ]
+        )
+
+
+        df[
+            "year"
+        ] = pd.to_numeric(
+            df[
+                "year"
+            ],
+            errors="coerce"
+        )
+
+
+        df[
+            "date"
+        ] = pd.to_datetime(
+            df[
+                "date"
+            ],
+            errors="coerce"
+        )
+
+
+        df[
+            "DOY"
+        ] = df[
+            "date"
+        ].dt.dayofyear
+
+
+        for col in VEG_INDICES:
+
+            df[
+                col
+            ] = pd.to_numeric(
+                df[
+                    col
+                ],
+                errors="coerce"
+            )
+
+
+        # ====================================================
+        # FIX MODIS NDVI SCALE IF NECESSARY
+        # ====================================================
+
+        ndvi_valid = (
+
+            df[
+                "NDVI"
+            ]
+
+            .replace(
+                [
+                    np.inf,
+                    -np.inf
+                ],
+                np.nan
+            )
+
+            .dropna()
+
+        )
+
+
+        if len(
+            ndvi_valid
+        ) > 0:
+
+            q95 = (
+                ndvi_valid
+                .abs()
+                .quantile(
+                    0.95
+                )
+            )
+
+
+            if q95 > 2:
+
+                print(
+                    "  Scaling NDVI × 0.0001"
+                )
+
+
+                df[
+                    "NDVI"
+                ] = (
+
+                    df[
+                        "NDVI"
+                    ]
+
+                    *
+                    0.0001
+
+                )
+
+
+        df.loc[
+
+            ~df[
+                "NDVI"
+            ].between(
+                -1,
+                1
+            ),
+
+            "NDVI"
+
+        ] = np.nan
+
+
+        # ====================================================
+        # VALID KEYS
+        # ====================================================
+
+        df = df[
+
+            df[
+                "year"
+            ].notna()
+
+            &
+
+            df[
+                "DOY"
+            ].notna()
+
+        ].copy()
+
+
+        df[
+            "year"
+        ] = (
+            df[
+                "year"
+            ]
+            .astype(int)
+        )
+
+
+        df[
+            "DOY"
+        ] = (
+            df[
+                "DOY"
+            ]
+            .astype(int)
+        )
+
+
+        dfs.append(
+            df
+        )
+
+
+    if len(dfs) == 0:
+
+        raise RuntimeError(
+            f"No usable {label} data."
+        )
+
+
+    # ========================================================
+    # LONG
+    # ========================================================
+
+    gee_long = pd.concat(
+        dfs,
+        ignore_index=True
+    )
+
+
+    print(
+        "\nRaw long shape:",
+        gee_long.shape
+    )
+
+
+    duplicates = gee_long.duplicated(
+
+        subset=[
+            "GEOID",
+            "year",
+            "DOY"
+        ],
+
+        keep=False
+
+    )
+
+
+    print(
+        "Duplicate GEOID-year-DOY rows:",
+        int(
+            duplicates.sum()
+        )
+    )
+
+
+    if duplicates.any():
+
+        gee_long = (
+
+            gee_long
+
+            .groupby(
+
+                [
+                    "GEOID",
+                    "year",
+                    "DOY"
+                ],
+
+                as_index=False
+
+            )[VEG_INDICES]
+
+            .mean()
+
+        )
+
+
+    # ========================================================
+    # WIDE
+    # ========================================================
+
+    wide_parts = []
+
+
+    for col in VEG_INDICES:
+
+        temp = gee_long.pivot_table(
+
+            index=[
+                "GEOID",
+                "year"
+            ],
+
+            columns=
+                "DOY",
+
+            values=
+                col,
+
+            aggfunc=
+                "mean"
+
+        )
+
+
+        temp.columns = [
+
+            f"{col}_DOY_{int(d)}"
+
+            for d in temp.columns
+
+        ]
+
+
+        wide_parts.append(
+            temp
+        )
+
+
+    gee_wide = (
+
+        pd.concat(
+            wide_parts,
+            axis=1
+        )
+
+        .reset_index()
+
+        .sort_values(
+            [
+                "GEOID",
+                "year"
+            ]
+        )
+
+        .reset_index(
+            drop=True
+        )
+
+    )
+
+
+    print(
+        f"\n{label} wide shape:",
+        gee_wide.shape
+    )
+
+
+    print(
+        "County-years:",
+        gee_wide[
+            [
+                "GEOID",
+                "year"
+            ]
+        ]
+        .drop_duplicates()
+        .shape[0]
+    )
+
+
+    ndvi_cols = [
+
+        c
+
+        for c in gee_wide.columns
+
+        if c.startswith(
+            "NDVI_DOY_"
+        )
+
+    ]
+
+
+    if len(ndvi_cols) > 0:
+
+        print(
+            "NDVI range:",
+            np.nanmin(
+                gee_wide[
+                    ndvi_cols
+                ].values
+            ),
+            "to",
+            np.nanmax(
+                gee_wide[
+                    ndvi_cols
+                ].values
+            )
+        )
+
+
+    return gee_wide
+
+# ============================================================
+# CELL 5 — BUILD CANONICAL HISTORICAL VEGETATION TABLE
+# ============================================================
+
+same_year_gee_wide = build_gee_wide(
+
+    same_year_csvs,
+
+    label=
+        "SAME-YEAR FINAL CDL"
+
+)
+
+
+if same_year_gee_wide.empty:
+
+    raise RuntimeError(
+        "No usable SAME-YEAR historical vegetation data were built."
+    )
+
+
+print(
+    "\n" + "=" * 75
+)
+
+print(
+    "CANONICAL HISTORICAL VEGETATION"
+)
+
+print(
+    "=" * 75
+)
+
+print(
+    "Same-year shape:",
+    same_year_gee_wide.shape
+)
+
+# CELL 6 — LOAD + CLEAN COUNTY CORN YIELD
+# ============================================================
+
+if len(
+    yield_candidates
+) == 0:
+
+    raise FileNotFoundError(
+        "No yield CSV found."
+    )
+
+
+yield_file = max(
+
+    yield_candidates,
+
+    key=
+        os.path.getsize
+
+)
+
+
+print(
+    "Yield file:"
+)
+
+print(
+    yield_file
+)
+
+
+yield_raw = pd.read_csv(
+    yield_file,
+    low_memory=False
+)
+
+
+yield_raw.columns = [
+
+    c.strip()
+
+    for c in yield_raw.columns
+
+]
+
+
+yield_df = yield_raw.copy()
+
+
+yield_df = yield_df[
+
+    (yield_df["Geo Level"] == "COUNTY")
+
+    &
+
+    (yield_df["Commodity"] == "CORN")
+
+    &
+
+    (
+        yield_df["Data Item"]
+        ==
+        "CORN, GRAIN - YIELD, MEASURED IN BU / ACRE"
+    )
+
+    &
+
+    (yield_df["Period"] == "YEAR")
+
+    &
+
+    (yield_df["Domain"] == "TOTAL")
+
+].copy()
+
+
+yield_df = yield_df[
+
+    yield_df[
+        "State ANSI"
+    ].notna()
+
+    &
+
+    yield_df[
+        "County ANSI"
+    ].notna()
+
+].copy()
+
+
+state_ansi = pd.to_numeric(
+
+    yield_df[
+        "State ANSI"
+    ],
+
+    errors="coerce"
+
+)
+
+
+county_ansi = pd.to_numeric(
+
+    yield_df[
+        "County ANSI"
+    ],
+
+    errors="coerce"
+
+)
+
+
+yield_df[
+    "year"
+] = pd.to_numeric(
+
+    yield_df[
+        "Year"
+    ],
+
+    errors="coerce"
+
+)
+
+
+yield_df[
+    "yield_bu_acre"
+] = pd.to_numeric(
+
+    yield_df[
+        "Value"
+    ]
+    .astype(str)
+    .str.replace(
+        ",",
+        "",
+        regex=False
+    ),
+
+    errors="coerce"
+
+)
+
+
+valid = (
+
+    state_ansi.notna()
+
+    &
+
+    county_ansi.notna()
+
+    &
+
+    yield_df[
+        "year"
+    ].notna()
+
+    &
+
+    yield_df[
+        "yield_bu_acre"
+    ].notna()
+
+)
+
+
+yield_df = yield_df.loc[
+    valid
+].copy()
+
+
+yield_df[
+    "FIPS"
+] = (
+
+    state_ansi.loc[
+        valid
+    ]
+
+    .astype(int)
+
+    .astype(str)
+
+    .str.zfill(2)
+
+    +
+
+    county_ansi.loc[
+        valid
+    ]
+
+    .astype(int)
+
+    .astype(str)
+
+    .str.zfill(3)
+
+)
+
+
+yield_df[
+    "year"
+] = (
+
+    yield_df[
+        "year"
+    ]
+
+    .astype(int)
+
+)
+
+
+yield_clean_df = (
+
+    yield_df[
+        [
+            "FIPS",
+            "year",
+            "yield_bu_acre"
+        ]
+    ]
+
+    .drop_duplicates(
+        subset=[
+            "FIPS",
+            "year"
+        ]
+    )
+
+    .sort_values(
+        [
+            "FIPS",
+            "year"
+        ]
+    )
+
+    .reset_index(
+        drop=True
+    )
+
+)
+
+
+print(
+    "Yield shape:",
+    yield_clean_df.shape
+)
+
+print(
+    "Years:",
+    yield_clean_df[
+        "year"
+    ].min(),
+    "to",
+    yield_clean_df[
+        "year"
+    ].max()
+)
+
+print(
+    "Counties:",
+    yield_clean_df[
+        "FIPS"
+    ].nunique()
+)
+
+# ============================================================
+# CELL 7 — HISTORICAL YIELD FEATURES
+#
+# No current-year information enters hist_5yr/hist_3yr.
+# No yield interpolation.
+# ============================================================
+
+yield_features = (
+
+    yield_clean_df
+
+    .copy()
+
+    .sort_values(
+        [
+            "FIPS",
+            "year"
+        ]
+    )
+
+    .reset_index(
+        drop=True
+    )
+
+)
+
+
+yield_features[
+    "hist_5yr"
+] = (
+
+    yield_features
+
+    .groupby(
+        "FIPS"
+    )[
+        "yield_bu_acre"
+    ]
+
+    .transform(
+
+        lambda x:
+
+            x.shift(1)
+
+            .rolling(
+                5,
+                min_periods=5
+            )
+
+            .mean()
+
+    )
+
+)
+
+
+yield_features[
+    "hist_3yr"
+] = (
+
+    yield_features
+
+    .groupby(
+        "FIPS"
+    )[
+        "yield_bu_acre"
+    ]
+
+    .transform(
+
+        lambda x:
+
+            x.shift(1)
+
+            .rolling(
+                3,
+                min_periods=3
+            )
+
+            .mean()
+
+    )
+
+)
+
+
+yield_features[
+    "yield_anomaly"
+] = (
+
+    yield_features[
+        "yield_bu_acre"
+    ]
+
+    -
+
+    yield_features[
+        "hist_5yr"
+    ]
+
+)
+
+
+print(
+    "Rows:",
+    len(
+        yield_features
+    )
+)
+
+print(
+    "hist_5yr available:",
+    yield_features[
+        "hist_5yr"
+    ].notna().sum()
+)
+
+# ============================================================
+# CELL 8 — MERGE YIELD FEATURES INTO VEGETATION
+# ============================================================
+
+def prepare_vegetation_dataset(
+    vegetation_df,
+    label
+):
+
+    df = vegetation_df.copy()
+
+
+    if "FIPS" not in df.columns:
+
+        if "GEOID" in df.columns:
+
+            df = df.rename(
+                columns={
+                    "GEOID":
+                        "FIPS"
+                }
+            )
+
+        else:
+
+            raise KeyError(
+                f"{label}: no FIPS/GEOID."
+            )
+
+
+    df[
+        "FIPS"
+    ] = clean_fips(
+        df[
+            "FIPS"
+        ]
+    )
+
+
+    df[
+        "year"
+    ] = pd.to_numeric(
+        df[
+            "year"
+        ],
+        errors="coerce"
+    )
+
+
+    df = df[
+        df[
+            "year"
+        ].notna()
+    ].copy()
+
+
+    df[
+        "year"
+    ] = (
+        df[
+            "year"
+        ]
+        .astype(int)
+    )
+
+
+    dup = df.duplicated(
+
+        subset=[
+            "FIPS",
+            "year"
+        ]
+
+    ).sum()
+
+
+    if dup > 0:
+
+        raise ValueError(
+            f"{label}: {dup} duplicate county-years."
+        )
+
+
+    df = df.merge(
+
+        yield_features[
+            [
+                "FIPS",
+                "year",
+                "yield_bu_acre",
+                "hist_5yr",
+                "hist_3yr",
+                "yield_anomaly"
+            ]
+        ],
+
+        on=[
+            "FIPS",
+            "year"
+        ],
+
+        how="left",
+
+        validate="one_to_one"
+
+    )
+
+
+    print(
+        "\n",
+        label
+    )
+
+    print(
+        "Shape:",
+        df.shape
+    )
+
+    print(
+        "Yield rows:",
+        df[
+            "yield_bu_acre"
+        ].notna().sum()
+    )
+
+    print(
+        "hist_5yr rows:",
+        df[
+            "hist_5yr"
+        ].notna().sum()
+    )
+
+
+    return df
+
+
+same_year_cdl_df = prepare_vegetation_dataset(
+
+    same_year_gee_wide,
+
+    "SAME-YEAR FINAL CDL"
+
+)
+
+# ============================================================
+# CELL 9 — STRICT VEGETATION ANOMALIES
+#
+# Current year excluded using shift(1).
+# ============================================================
+
+def add_vegetation_anomalies(
+    input_df,
+    label
+):
+
+    df = input_df.copy()
+
+
+    df = (
+
+        df
+
+        .sort_values(
+            [
+                "FIPS",
+                "year"
+            ]
+        )
+
+        .reset_index(
+            drop=True
+        )
+
+    )
+
+
+    # Remove previous anomaly columns on rerun.
+
+    old_anoms = [
+
+        c
+
+        for c in df.columns
+
+        if c.endswith(
+            "_anom"
+        )
+
+        and
+        "_DOY_" in c
+
+    ]
+
+
+    if len(old_anoms) > 0:
+
+        df = df.drop(
+            columns=old_anoms
+        )
+
+
+    created = []
+
+
+    for idx in VEG_INDICES:
+
+
+        raw_cols = [
+
+            c
+
+            for c in df.columns
+
+            if (
+                c.startswith(
+                    idx + "_DOY_"
+                )
+
+                and
+
+                not c.endswith(
+                    "_anom"
+                )
+            )
+
+        ]
+
+
+        raw_cols = sorted(
+
+            raw_cols,
+
+            key=lambda c:
+
+                int(
+                    c.split(
+                        "_DOY_"
+                    )[-1]
+                )
+
+        )
+
+
+        for col in raw_cols:
+
+
+            historical_mean = (
+
+                df
+
+                .groupby(
+                    "FIPS"
+                )[col]
+
+                .transform(
+
+                    lambda x:
+
+                        x.shift(1)
+
+                        .expanding(
+                            min_periods=3
+                        )
+
+                        .mean()
+
+                )
+
+            )
+
+
+            anomaly_col = (
+                col
+                +
+                "_anom"
+            )
+
+
+            df[
+                anomaly_col
+            ] = (
+
+                pd.to_numeric(
+                    df[
+                        col
+                    ],
+                    errors="coerce"
+                )
+
+                -
+
+                historical_mean
+
+            )
+
+
+            created.append(
+                anomaly_col
+            )
+
+
+    print(
+        label,
+        "| anomaly columns:",
+        len(created)
+    )
+
+
+    return df
+
+
+same_year_cdl_df = add_vegetation_anomalies(
+
+    same_year_cdl_df,
+
+    "SAME-YEAR FINAL CDL"
+
+)
+
+# ============================================================
+# CELL 10 — FILTER MODEL ROWS
+# ============================================================
+
+def filter_model_rows(
+    df,
+    label
+):
+
+    out = df[
+
+        df[
+            "yield_bu_acre"
+        ].notna()
+
+        &
+
+        df[
+            "hist_5yr"
+        ].notna()
+
+    ].copy()
+
+
+    out = out.reset_index(
+        drop=True
+    )
+
+
+    print(
+        "\n" + "=" * 75
+    )
+
+    print(
+        label
+    )
+
+    print(
+        "=" * 75
+    )
+
+
+    print(
+        "Rows:",
+        f"{len(out):,}"
+    )
+
+    print(
+        "Counties:",
+        out[
+            "FIPS"
+        ].nunique()
+    )
+
+    print(
+        "Years:",
+        sorted(
+            out[
+                "year"
+            ].unique()
+        )
+    )
+
+
+    return out
+
+
+same_year_model_df = filter_model_rows(
+
+    same_year_cdl_df,
+
+    "SAME-YEAR FINAL-CDL MODEL DATA"
+
+)
+
+
+# ============================================================
+# CANONICAL TRAINING TABLE
+# ============================================================
+
+model_df = same_year_model_df.copy()
+
+
+print(
+    "\n✓ model_df = SAME-YEAR FINAL-CDL historical training"
+)
+
+# ============================================================
+# CELL 11 — COMPACT RAW PRISM WEATHER
+#
+# Final production weather block selected by ablation:
+#
+#   15 physically meaningful raw compact PRISM variables.
+#
+# No PRISM anomaly features.
+# No AWC / AWC interactions.
+# No SOC / CEC.
+# No LST.
+# ============================================================
+
+import os
+import re
+
+import numpy as np
+import pandas as pd
+
+
+# ============================================================
+# 1. RAW PRISM VARIABLES AVAILABLE IN THE SOURCE FILES
+# ============================================================
+
+RAW_SOURCE_VARS = [
+
+    "tmin",
+    "tmean",
+    "tmax",
+
+    "ppt",
+
+    "vpdmin",
+    "vpdmean",
+    "vpdmax",
+
+    "heat30",
+    "hot35days",
+    "drydays"
+
+]
+
+
+# ============================================================
+# 2. FINAL 15-VARIABLE COMPACT WEATHER BLOCK
+# ============================================================
+
+RAW_PRISM = [
+
+    "recent16_tmin",
+    "recent16_tmean",
+    "recent16_tmax",
+
+    "recent16_ppt",
+    "recent32_ppt",
+    "season_ppt",
+
+    "recent16_vpdmean",
+    "recent16_vpdmax",
+    "season_vpdmean",
+
+    "recent16_heat30",
+    "season_heat30",
+
+    "recent16_hot35days",
+    "season_hot35days",
+
+    "recent16_drydays",
+    "season_drydays"
+
+]
+
+
+# The canonical production environment contains ONLY these 15 features.
+BASE_ENV = list(
+    RAW_PRISM
+)
+
+
+# ============================================================
+# 3. HELPERS
+# ============================================================
+
+def infer_year_from_filename(path):
+
+    matches = re.findall(
+        r"(20\d{2})",
+        os.path.basename(path)
+    )
+
+    if len(matches) == 0:
+
+        return None
+
+    return int(
+        matches[-1]
+    )
+
+
+def find_existing_column(
+    columns,
+    candidates
+):
+
+    lookup = {
+
+        str(c).lower():
+            c
+
+        for c in columns
+
+    }
+
+
+    for candidate in candidates:
+
+        if candidate.lower() in lookup:
+
+            return lookup[
+                candidate.lower()
+            ]
+
+
+    return None
+
+
+def discover_doys(
+    columns
+):
+
+    doys = set()
+
+
+    for col in columns:
+
+        match = re.search(
+
+            r"_DOY_(\d+)$",
+
+            str(col),
+
+            flags=re.IGNORECASE
+
+        )
+
+
+        if match:
+
+            doys.add(
+                int(
+                    match.group(1)
+                )
+            )
+
+
+    return sorted(
+        doys
+    )
+
+
+def find_doy_column(
+    columns,
+    prefix,
+    doy
+):
+
+    lookup = {
+
+        str(c).lower():
+            c
+
+        for c in columns
+
+    }
+
+
+    candidates = [
+
+        f"{prefix}_DOY_{doy}",
+
+        f"{prefix}_DOY_{doy:03d}"
+
+    ]
+
+
+    for candidate in candidates:
+
+        if candidate.lower() in lookup:
+
+            return lookup[
+                candidate.lower()
+            ]
+
+
+    return None
+
+
+# ============================================================
+# 4. LOAD WIDE PRISM FILES -> LONG CHECKPOINT TABLE
+# ============================================================
+
+if len(
+    prism_csvs
+) == 0:
+
+    raise FileNotFoundError(
+        "No PRISM weather files found."
+    )
+
+
+prism_parts = []
+
+
+for path in prism_csvs:
+
+
+    print(
+        "Loading PRISM:",
+        os.path.basename(path)
+    )
+
+
+    wide = pd.read_csv(
+        path,
+        low_memory=False
+    )
+
+
+    wide.columns = [
+
+        str(c).strip()
+
+        for c in wide.columns
+
+    ]
+
+
+    # --------------------------------------------------------
+    # FIPS
+    # --------------------------------------------------------
+
+    fips_col = find_existing_column(
+
+        wide.columns,
+
+        [
+            "FIPS",
+            "GEOID"
+        ]
+
+    )
+
+
+    if fips_col is None:
+
+        raise KeyError(
+            "No FIPS/GEOID found in "
+            +
+            os.path.basename(path)
+        )
+
+
+    wide[
+        "FIPS"
+    ] = clean_fips(
+        wide[
+            fips_col
+        ]
+    )
+
+
+    # --------------------------------------------------------
+    # YEAR
+    # --------------------------------------------------------
+
+    year_col = find_existing_column(
+
+        wide.columns,
+
+        [
+            "year",
+            "YEAR",
+            "Year"
+        ]
+
+    )
+
+
+    if year_col is not None:
+
+        wide[
+            "year"
+        ] = pd.to_numeric(
+
+            wide[
+                year_col
+            ],
+
+            errors="coerce"
+
+        )
+
+
+    else:
+
+        file_year = infer_year_from_filename(
+            path
+        )
+
+
+        if file_year is None:
+
+            raise ValueError(
+                "Could not determine year for "
+                +
+                os.path.basename(path)
+            )
+
+
+        wide[
+            "year"
+        ] = file_year
+
+
+    # --------------------------------------------------------
+    # DOYs
+    # --------------------------------------------------------
+
+    doys = discover_doys(
+        wide.columns
+    )
+
+
+    if len(
+        doys
+    ) == 0:
+
+        raise ValueError(
+            "No *_DOY_* columns found in "
+            +
+            os.path.basename(path)
+        )
+
+
+    print(
+        "  DOYs:",
+        doys
+    )
+
+
+    # --------------------------------------------------------
+    # Verify the raw PRISM source variables.
+    # --------------------------------------------------------
+
+    first_doy = doys[
+        0
+    ]
+
+
+    missing_raw = []
+
+
+    for variable in RAW_SOURCE_VARS:
+
+
+        found = find_doy_column(
+
+            wide.columns,
+
+            variable,
+
+            first_doy
+
+        )
+
+
+        if found is None:
+
+            missing_raw.append(
+                variable
+            )
+
+
+    if len(
+        missing_raw
+    ) > 0:
+
+        raise KeyError(
+            "Missing raw PRISM variables in "
+            +
+            os.path.basename(path)
+            +
+            ":\n"
+            +
+            str(
+                missing_raw
+            )
+        )
+
+
+    # --------------------------------------------------------
+    # Build one row per county-year-checkpoint.
+    # --------------------------------------------------------
+
+    for doy in doys:
+
+
+        part = pd.DataFrame({
+
+            "FIPS":
+                wide[
+                    "FIPS"
+                ].values,
+
+            "year":
+                wide[
+                    "year"
+                ].values,
+
+            "DOY":
+                doy
+
+        })
+
+
+        for variable in RAW_SOURCE_VARS:
+
+
+            source_col = find_doy_column(
+
+                wide.columns,
+
+                variable,
+
+                doy
+
+            )
+
+
+            if source_col is None:
+
+                part[
+                    variable
+                ] = np.nan
+
+
+            else:
+
+                part[
+                    variable
+                ] = pd.to_numeric(
+
+                    wide[
+                        source_col
+                    ],
+
+                    errors="coerce"
+
+                ).values
+
+
+        prism_parts.append(
+            part
+        )
+
+
+# ============================================================
+# 5. CONCATENATE YEARS + CLEAN KEYS
+# ============================================================
+
+environment_raw = pd.concat(
+
+    prism_parts,
+
+    ignore_index=True
+
+)
+
+
+environment_raw[
+    "year"
+] = pd.to_numeric(
+
+    environment_raw[
+        "year"
+    ],
+
+    errors="coerce"
+
+)
+
+
+environment_raw[
+    "DOY"
+] = pd.to_numeric(
+
+    environment_raw[
+        "DOY"
+    ],
+
+    errors="coerce"
+
+)
+
+
+environment_raw = environment_raw[
+
+    environment_raw[
+        "year"
+    ].notna()
+
+    &
+
+    environment_raw[
+        "DOY"
+    ].notna()
+
+].copy()
+
+
+environment_raw[
+    "year"
+] = environment_raw[
+    "year"
+].astype(
+    int
+)
+
+
+environment_raw[
+    "DOY"
+] = environment_raw[
+    "DOY"
+].astype(
+    int
+)
+
+
+# ============================================================
+# 6. HANDLE DUPLICATES DETERMINISTICALLY
+# ============================================================
+
+duplicate_count = environment_raw.duplicated(
+
+    subset=[
+        "FIPS",
+        "year",
+        "DOY"
+    ],
+
+    keep=False
+
+).sum()
+
+
+print(
+    "\nDuplicate FIPS-year-DOY weather rows:",
+    duplicate_count
+)
+
+
+if duplicate_count > 0:
+
+    environment_raw = (
+
+        environment_raw
+
+        .groupby(
+
+            [
+                "FIPS",
+                "year",
+                "DOY"
+            ],
+
+            as_index=False
+
+        )[RAW_SOURCE_VARS]
+
+        .mean()
+
+    )
+
+
+environment_raw = (
+
+    environment_raw
+
+    .sort_values(
+        [
+            "FIPS",
+            "year",
+            "DOY"
+        ]
+    )
+
+    .reset_index(
+        drop=True
+    )
+
+)
+
+
+# ============================================================
+# 7. BUILD THE 15 COMPACT WEATHER FEATURES
+# ============================================================
+
+environment = environment_raw[
+    [
+        "FIPS",
+        "year",
+        "DOY"
+    ]
+].copy()
+
+
+# Recent 16-day weather.
+environment[
+    "recent16_tmin"
+] = environment_raw[
+    "tmin"
+]
+
+
+environment[
+    "recent16_tmean"
+] = environment_raw[
+    "tmean"
+]
+
+
+environment[
+    "recent16_tmax"
+] = environment_raw[
+    "tmax"
+]
+
+
+environment[
+    "recent16_ppt"
+] = environment_raw[
+    "ppt"
+]
+
+
+environment[
+    "recent16_vpdmean"
+] = environment_raw[
+    "vpdmean"
+]
+
+
+environment[
+    "recent16_vpdmax"
+] = environment_raw[
+    "vpdmax"
+]
+
+
+environment[
+    "recent16_heat30"
+] = environment_raw[
+    "heat30"
+]
+
+
+environment[
+    "recent16_hot35days"
+] = environment_raw[
+    "hot35days"
+]
+
+
+environment[
+    "recent16_drydays"
+] = environment_raw[
+    "drydays"
+]
+
+
+# Previous 32 days of precipitation.
+environment[
+    "recent32_ppt"
+] = (
+
+    environment_raw
+
+    .groupby(
+        [
+            "FIPS",
+            "year"
+        ]
+    )[
+        "ppt"
+    ]
+
+    .transform(
+
+        lambda x:
+
+            x.rolling(
+                2,
+                min_periods=1
+            )
+            .sum()
+
+    )
+
+)
+
+
+# Season-to-date precipitation.
+environment[
+    "season_ppt"
+] = (
+
+    environment_raw
+
+    .groupby(
+        [
+            "FIPS",
+            "year"
+        ]
+    )[
+        "ppt"
+    ]
+
+    .cumsum()
+
+)
+
+
+# Season-to-date mean VPD.
+environment[
+    "season_vpdmean"
+] = (
+
+    environment_raw
+
+    .groupby(
+        [
+            "FIPS",
+            "year"
+        ]
+    )[
+        "vpdmean"
+    ]
+
+    .transform(
+
+        lambda x:
+
+            x.expanding(
+                min_periods=1
+            )
+            .mean()
+
+    )
+
+)
+
+
+# Season-to-date heat / hot-day / dry-day stress.
+environment[
+    "season_heat30"
+] = (
+
+    environment_raw
+
+    .groupby(
+        [
+            "FIPS",
+            "year"
+        ]
+    )[
+        "heat30"
+    ]
+
+    .cumsum()
+
+)
+
+
+environment[
+    "season_hot35days"
+] = (
+
+    environment_raw
+
+    .groupby(
+        [
+            "FIPS",
+            "year"
+        ]
+    )[
+        "hot35days"
+    ]
+
+    .cumsum()
+
+)
+
+
+environment[
+    "season_drydays"
+] = (
+
+    environment_raw
+
+    .groupby(
+        [
+            "FIPS",
+            "year"
+        ]
+    )[
+        "drydays"
+    ]
+
+    .cumsum()
+
+)
+
+
+# ============================================================
+# 8. FINAL COMPACT-WEATHER DIAGNOSTICS
+# ============================================================
+
+print(
+    "\n" + "=" * 75
+)
+
+print(
+    "CANONICAL COMPACT PRISM WEATHER READY"
+)
+
+print(
+    "=" * 75
+)
+
+
+print(
+    "Environment shape:",
+    environment.shape
+)
+
+
+print(
+    "Counties:",
+    environment[
+        "FIPS"
+    ].nunique()
+)
+
+
+print(
+    "Years:",
+    environment[
+        "year"
+    ].min(),
+    "to",
+    environment[
+        "year"
+    ].max()
+)
+
+
+print(
+    "DOYs:",
+    sorted(
+        environment[
+            "DOY"
+        ].unique()
+    )
+)
+
+
+print(
+    "BASE_ENV predictors:",
+    len(
+        BASE_ENV
+    )
+)
+
+
+if len(
+    BASE_ENV
+) != 15:
+
+    raise RuntimeError(
+        "Canonical BASE_ENV must contain exactly 15 compact PRISM features."
+    )
+
+
+print(
+    "✓ BASE_ENV = 15 compact raw PRISM predictors"
+)
+
+
+print(
+    "\nMissing compact PRISM values:"
+)
+
+
+print(
+
+    environment[
+        BASE_ENV
+    ]
+    .isna()
+    .sum()
+
+)
+
+
+display(
+    environment.head(
+        10
+    )
+)
+
+# CELL 12 — BUILD VEGETATION FEATURES
+#
+# CRITICAL:
+#
+# 1. Remove DOYs > doy_cut
+# 2. THEN interpolate season-to-date
+# 3. THEN calculate derived features
+#
+# Future vegetation cannot enter an earlier forecast.
+# ============================================================
+
+def build_features(
+    df_sub,
+    doy_cut
+):
+
+    feature_list = []
+
+
+    def get_doy(
+        column
+    ):
+
+        value = (
+            column
+            .split(
+                "_DOY_"
+            )[-1]
+            .replace(
+                "_anom",
+                ""
+            )
+        )
+
+
+        return int(
+            value
+        )
+
+
+    # ========================================================
+    # SEASON-TO-DATE INTERPOLATION
+    # ========================================================
+
+    def interpolate_matrix(
+        matrix,
+        doys
+    ):
+
+        X = np.asarray(
+            matrix,
+            dtype=float
+        ).copy()
+
+
+        doys = np.asarray(
+            doys,
+            dtype=float
+        )
+
+
+        output = np.full_like(
+            X,
+            np.nan,
+            dtype=float
+        )
+
+
+        for i in range(
+            X.shape[0]
+        ):
+
+
+            row = X[
+                i
+            ]
+
+
+            good = np.isfinite(
+                row
+            )
+
+
+            n_good = int(
+                good.sum()
+            )
+
+
+            if n_good == 0:
+
+                continue
+
+
+            if n_good == 1:
+
+                output[
+                    i,
+                    :
+                ] = row[
+                    good
+                ][0]
+
+
+                continue
+
+
+            output[
+                i,
+                :
+            ] = np.interp(
+
+                doys,
+
+                doys[
+                    good
+                ],
+
+                row[
+                    good
+                ]
+
+            )
+
+
+        return output
+
+
+    def row_auc(
+        values,
+        doys
+    ):
+
+        good = np.isfinite(
+            values
+        )
+
+
+        if good.sum() < 2:
+
+            return np.nan
+
+
+        x = doys[
+            good
+        ]
+
+        y = values[
+            good
+        ]
+
+
+        if hasattr(
+            np,
+            "trapezoid"
+        ):
+
+            return np.trapezoid(
+                y,
+                x
+            )
+
+
+        return np.trapz(
+            y,
+            x
+        )
+
+
+    def row_peak_doy(
+        values,
+        doys
+    ):
+
+        good = np.isfinite(
+            values
+        )
+
+
+        if good.sum() == 0:
+
+            return np.nan
+
+
+        y = values[
+            good
+        ]
+
+        x = doys[
+            good
+        ]
+
+
+        return x[
+            np.argmax(
+                y
+            )
+        ]
+
+
+    def row_slope(
+        values,
+        doys
+    ):
+
+        good = np.isfinite(
+            values
+        )
+
+
+        if good.sum() < 2:
+
+            return np.nan
+
+
+        return np.polyfit(
+
+            doys[
+                good
+            ],
+
+            values[
+                good
+            ],
+
+            1
+
+        )[0]
+
+
+    # ========================================================
+    # LOOP INDICES
+    # ========================================================
+
+    for idx in VEG_INDICES:
+
+
+        # ====================================================
+        # RAW DOY COLUMNS
+        # ====================================================
+
+        raw_cols = [
+
+            c
+
+            for c in df_sub.columns
+
+            if (
+                c.startswith(
+                    idx + "_DOY_"
+                )
+
+                and
+
+                not c.endswith(
+                    "_anom"
+                )
+            )
+
+        ]
+
+
+        raw_cols = [
+
+            c
+
+            for c in raw_cols
+
+            if get_doy(
+                c
+            )
+            <=
+            doy_cut
+
+        ]
+
+
+        raw_cols = sorted(
+
+            raw_cols,
+
+            key=
+                get_doy
+
+        )
+
+
+        if len(raw_cols) > 0:
+
+
+            raw_doys = np.array(
+
+                [
+                    get_doy(c)
+                    for c in raw_cols
+                ],
+
+                dtype=float
+
+            )
+
+
+            raw_matrix = (
+
+                df_sub[
+                    raw_cols
+                ]
+
+                .apply(
+                    pd.to_numeric,
+                    errors="coerce"
+                )
+
+                .to_numpy(
+                    dtype=float
+                )
+
+            )
+
+
+            X = interpolate_matrix(
+
+                raw_matrix,
+
+                raw_doys
+
+            )
+
+
+            # =================================================
+            # RAW DOY VALUES
+            # =================================================
+
+            feature_list.append(
+
+                pd.DataFrame(
+
+                    X,
+
+                    index=
+                        df_sub.index,
+
+                    columns=
+                        raw_cols
+
+                )
+
+            )
+
+
+            # =================================================
+            # SEASONAL FEATURES
+            # =================================================
+
+            feat = pd.DataFrame(
+                index=
+                    df_sub.index
+            )
+
+
+            Xdf = pd.DataFrame(
+
+                X,
+
+                index=
+                    df_sub.index
+
+            )
+
+
+            feat[
+                f"{idx}_mean"
+            ] = Xdf.mean(
+                axis=1
+            )
+
+
+            feat[
+                f"{idx}_max"
+            ] = Xdf.max(
+                axis=1
+            )
+
+
+            feat[
+                f"{idx}_min"
+            ] = Xdf.min(
+                axis=1
+            )
+
+
+            feat[
+                f"{idx}_std"
+            ] = Xdf.std(
+                axis=1,
+                ddof=0
+            )
+
+
+            feat[
+                f"{idx}_last"
+            ] = X[
+                :,
+                -1
+            ]
+
+
+            feat[
+                f"{idx}_auc"
+            ] = [
+
+                row_auc(
+                    row,
+                    raw_doys
+                )
+
+                for row in X
+
+            ]
+
+
+            feat[
+                f"{idx}_peak_doy"
+            ] = [
+
+                row_peak_doy(
+                    row,
+                    raw_doys
+                )
+
+                for row in X
+
+            ]
+
+
+            if X.shape[1] >= 3:
+
+                feat[
+                    f"{idx}_early_mean"
+                ] = (
+
+                    pd.DataFrame(
+
+                        X[
+                            :,
+                            :3
+                        ],
+
+                        index=
+                            df_sub.index
+
+                    )
+
+                    .mean(
+                        axis=1
+                    )
+
+                )
+
+
+            if X.shape[1] >= 2:
+
+
+                delta_doy = (
+
+                    raw_doys[
+                        -1
+                    ]
+
+                    -
+
+                    raw_doys[
+                        -2
+                    ]
+
+                )
+
+
+                if delta_doy > 0:
+
+                    feat[
+                        f"{idx}_slope_last"
+                    ] = (
+
+                        X[
+                            :,
+                            -1
+                        ]
+
+                        -
+
+                        X[
+                            :,
+                            -2
+                        ]
+
+                    ) / delta_doy
+
+
+            green_mask = (
+
+                (raw_doys >= 60)
+
+                &
+
+                (raw_doys <= 120)
+
+            )
+
+
+            green_doys = raw_doys[
+                green_mask
+            ]
+
+
+            green_X = X[
+                :,
+                green_mask
+            ]
+
+
+            if len(
+                green_doys
+            ) >= 2:
+
+                feat[
+                    f"{idx}_greenup_rate"
+                ] = [
+
+                    row_slope(
+                        row,
+                        green_doys
+                    )
+
+                    for row in green_X
+
+                ]
+
+
+            feature_list.append(
+                feat
+            )
+
+
+        # ====================================================
+        # ANOMALY FEATURES
+        # ====================================================
+
+        anom_cols = [
+
+            c
+
+            for c in df_sub.columns
+
+            if (
+                c.startswith(
+                    idx + "_DOY_"
+                )
+
+                and
+
+                c.endswith(
+                    "_anom"
+                )
+            )
+
+        ]
+
+
+        anom_cols = [
+
+            c
+
+            for c in anom_cols
+
+            if get_doy(
+                c
+            )
+            <=
+            doy_cut
+
+        ]
+
+
+        anom_cols = sorted(
+
+            anom_cols,
+
+            key=
+                get_doy
+
+        )
+
+
+        if len(anom_cols) > 0:
+
+
+            anom_doys = np.array(
+
+                [
+                    get_doy(c)
+                    for c in anom_cols
+                ],
+
+                dtype=float
+
+            )
+
+
+            raw_anom = (
+
+                df_sub[
+                    anom_cols
+                ]
+
+                .apply(
+                    pd.to_numeric,
+                    errors="coerce"
+                )
+
+                .to_numpy(
+                    dtype=float
+                )
+
+            )
+
+
+            X_anom = interpolate_matrix(
+
+                raw_anom,
+
+                anom_doys
+
+            )
+
+
+            feat_anom = pd.DataFrame(
+                index=
+                    df_sub.index
+            )
+
+
+            Adf = pd.DataFrame(
+
+                X_anom,
+
+                index=
+                    df_sub.index
+
+            )
+
+
+            feat_anom[
+                f"{idx}_anom_mean"
+            ] = Adf.mean(
+                axis=1
+            )
+
+
+            feat_anom[
+                f"{idx}_anom_max"
+            ] = Adf.max(
+                axis=1
+            )
+
+
+            feat_anom[
+                f"{idx}_anom_min"
+            ] = Adf.min(
+                axis=1
+            )
+
+
+            feat_anom[
+                f"{idx}_anom_last"
+            ] = X_anom[
+                :,
+                -1
+            ]
+
+
+            if X_anom.shape[1] >= 2:
+
+
+                delta_doy = (
+
+                    anom_doys[
+                        -1
+                    ]
+
+                    -
+
+                    anom_doys[
+                        -2
+                    ]
+
+                )
+
+
+                if delta_doy > 0:
+
+                    feat_anom[
+                        f"{idx}_anom_slope_last"
+                    ] = (
+
+                        X_anom[
+                            :,
+                            -1
+                        ]
+
+                        -
+
+                        X_anom[
+                            :,
+                            -2
+                        ]
+
+                    ) / delta_doy
+
+
+            feature_list.append(
+                feat_anom
+            )
+
+
+    if len(
+        feature_list
+    ) == 0:
+
+        return pd.DataFrame(
+            index=
+                df_sub.index
+        )
+
+
+    features = pd.concat(
+
+        feature_list,
+
+        axis=1
+
+    )
+
+
+    features = features.loc[
+        :,
+        ~features.columns.duplicated()
+    ]
+
+
+    features = features.replace(
+
+        [
+            np.inf,
+            -np.inf
+        ],
+
+        np.nan
+
+    )
+
+
+    return features
+
+
+print(
+    "✓ build_features() ready"
+)
+
+# ============================================================
+# CELL 13 — ENVIRONMENT LOOKUP
+# ============================================================
+
+environment[
+    "FIPS"
+] = clean_fips(
+    environment[
+        "FIPS"
+    ]
+)
+
+
+env_indexed = (
+
+    environment
+
+    .set_index(
+        [
+            "FIPS",
+            "year",
+            "DOY"
+        ]
+    )
+
+    .sort_index()
+
+)
+
+
+def get_environment(
+    rows,
+    doy
+):
+
+    keys = pd.MultiIndex.from_arrays(
+
+        [
+
+            rows[
+                "FIPS"
+            ].astype(str),
+
+            rows[
+                "year"
+            ].astype(int),
+
+            np.full(
+                len(rows),
+                int(doy)
+            )
+
+        ],
+
+        names=[
+            "FIPS",
+            "year",
+            "DOY"
+        ]
+
+    )
+
+
+    X = (
+
+        env_indexed
+
+        .reindex(
+            keys
+        )[
+            BASE_ENV
+        ]
+
+        .copy()
+
+    )
+
+
+    X.index = rows.index
+
+
+    return X
+
+
+print(
+    "✓ environment lookup ready"
+)
+
+# ============================================================
+# CELL 14 — BUILD MODEL MATRICES
+# ============================================================
+
+LEAKAGE_COLS = [
+
+    "yield_bu_acre",
+    "yield_filled",
+    "yield_anomaly",
+    "target",
+    "yield"
+
+]
+
+
+def build_model_matrices(
+    train_rows,
+    test_rows,
+    doy
+):
+
+    # ========================================================
+    # VEGETATION
+    # ========================================================
+
+    Xveg_train = build_features(
+        train_rows,
+        doy
+    )
+
+
+    Xveg_test = build_features(
+        test_rows,
+        doy
+    )
+
+
+    # ========================================================
+    # ENVIRONMENT
+    # ========================================================
+
+    Xenv_train = get_environment(
+        train_rows,
+        doy
+    )
+
+
+    Xenv_test = get_environment(
+        test_rows,
+        doy
+    )
+
+
+    # ========================================================
+    # CONCAT
+    # ========================================================
+
+    X_train = pd.concat(
+
+        [
+            Xveg_train,
+            Xenv_train
+        ],
+
+        axis=1
+
+    )
+
+
+    X_test = pd.concat(
+
+        [
+            Xveg_test,
+            Xenv_test
+        ],
+
+        axis=1
+
+    )
+
+
+    X_train = X_train.loc[
+        :,
+        ~X_train.columns.duplicated()
+    ]
+
+
+    X_test = X_test.loc[
+        :,
+        ~X_test.columns.duplicated()
+    ]
+
+
+    # ========================================================
+    # REMOVE TARGET COLUMNS
+    # ========================================================
+
+    X_train = X_train.drop(
+        columns=
+            LEAKAGE_COLS,
+        errors=
+            "ignore"
+    )
+
+
+    X_test = X_test.drop(
+        columns=
+            LEAKAGE_COLS,
+        errors=
+            "ignore"
+    )
+
+
+    # ========================================================
+    # EXPLICIT BASELINE + YEAR
+    # ========================================================
+
+    X_train[
+        "hist_5yr"
+    ] = train_rows[
+        "hist_5yr"
+    ].values
+
+
+    X_test[
+        "hist_5yr"
+    ] = test_rows[
+        "hist_5yr"
+    ].values
+
+
+    X_train[
+        "year"
+    ] = train_rows[
+        "year"
+    ].astype(float).values
+
+
+    X_test[
+        "year"
+    ] = test_rows[
+        "year"
+    ].astype(float).values
+
+
+    # ========================================================
+    # NUMERIC ONLY
+    # ========================================================
+
+    X_train = X_train.select_dtypes(
+        include=[
+            np.number,
+            "bool"
+        ]
+    )
+
+
+    X_test = X_test.select_dtypes(
+        include=[
+            np.number,
+            "bool"
+        ]
+    )
+
+
+    # ========================================================
+    # ALIGN COLUMNS
+    # ========================================================
+
+    common_cols = [
+
+        c
+
+        for c in X_train.columns
+
+        if c in X_test.columns
+
+    ]
+
+
+    X_train = X_train[
+        common_cols
+    ]
+
+
+    X_test = X_test[
+        common_cols
+    ]
+
+
+    X_train = X_train.replace(
+        [
+            np.inf,
+            -np.inf
+        ],
+        np.nan
+    )
+
+
+    X_test = X_test.replace(
+        [
+            np.inf,
+            -np.inf
+        ],
+        np.nan
+    )
+
+
+    # ========================================================
+    # REMOVE FEATURES WITH ZERO TRAIN INFORMATION
+    # ========================================================
+
+    useful = X_train.notna().any(
+        axis=0
+    )
+
+
+    X_train = X_train.loc[
+        :,
+        useful
+    ]
+
+
+    X_test = X_test.loc[
+        :,
+        useful
+    ]
+
+
+    # ========================================================
+    # TRAINING-ONLY MEDIAN IMPUTATION
+    # ========================================================
+
+    medians = X_train.median()
+
+
+    X_train = X_train.fillna(
+        medians
+    )
+
+
+    X_test = X_test.fillna(
+        medians
+    )
+
+
+    return (
+        X_train,
+        X_test
+    )
+
+
+print(
+    "✓ model matrix builder ready"
+)
+
+# ============================================================
+# CELL 15 — XGBOOST MODEL
+# ============================================================
+
+def make_model(
+    seed=42
+):
+
+    params = dict(
+        XGB_PARAMS
+    )
+
+    params[
+        "random_state"
+    ] = seed
+
+
+    return XGBRegressor(
+        **params
+    )
+
+
+print(
+    "✓ canonical XGBoost model ready"
+)
+
+# CELL 16 — EXPANDING-YEAR SEASONAL VALIDATION
+#
+# Train:
+#   all years < held-out year
+#
+# Test:
+#   held-out year
+#
+# Historical vegetation:
+#   SAME-YEAR FINAL CDL
+#
+# Target:
+#   yield anomaly
+# ============================================================
+
+DOY_LIST = [
+
+    65,
+    81,
+    97,
+    113,
+    129,
+    145,
+    161,
+    177,
+    193,
+    209,
+    225,
+    241,
+    257,
+    273
+
+]
+
+
+available_years = sorted(
+    model_df[
+        "year"
+    ].unique()
+)
+
+
+TEST_YEARS = [
+
+    y
+
+    for y in range(
+        2018,
+        2023
+    )
+
+    if y in available_years
+
+]
+
+
+print(
+    "Historical validation years:",
+    TEST_YEARS
+)
+
+
+seasonal_results = []
+
+
+for doy in DOY_LIST:
+
+
+    print(
+        "\nDOY",
+        doy
+    )
+
+
+    for test_year in TEST_YEARS:
+
+
+        train_rows = model_df[
+
+            model_df[
+                "year"
+            ]
+            <
+            test_year
+
+        ].copy()
+
+
+        test_rows = model_df[
+
+            model_df[
+                "year"
+            ]
+            ==
+            test_year
+
+        ].copy()
+
+
+        if (
+            len(train_rows) == 0
+            or
+            len(test_rows) == 0
+        ):
+
+            continue
+
+
+        X_train, X_test = build_model_matrices(
+
+            train_rows,
+            test_rows,
+            doy
+
+        )
+
+
+        y_train = train_rows[
+            "yield_anomaly"
+        ].values
+
+
+        model = make_model(
+            seed=42
+        )
+
+
+        model.fit(
+            X_train,
+            y_train
+        )
+
+
+        pred_anomaly = model.predict(
+            X_test
+        )
+
+
+        pred_yield = (
+
+            test_rows[
+                "hist_5yr"
+            ].values
+
+            +
+
+            pred_anomaly
+
+        )
+
+
+        actual = test_rows[
+            "yield_bu_acre"
+        ].values
+
+
+        r2 = r2_score(
+            actual,
+            pred_yield
+        )
+
+
+        rmse = np.sqrt(
+
+            mean_squared_error(
+                actual,
+                pred_yield
+            )
+
+        )
+
+
+        mae = mean_absolute_error(
+            actual,
+            pred_yield
+        )
+
+
+        seasonal_results.append({
+
+            "DOY":
+                doy,
+
+            "TestYear":
+                test_year,
+
+            "R2":
+                r2,
+
+            "RMSE":
+                rmse,
+
+            "MAE":
+                mae,
+
+            "N":
+                len(
+                    test_rows
+                )
+
+        })
+
+
+        print(
+
+            test_year,
+
+            "| R²",
+            round(
+                r2,
+                3
+            ),
+
+            "| RMSE",
+            round(
+                rmse,
+                2
+            )
+
+        )
+
+
+seasonal_results_df = pd.DataFrame(
+    seasonal_results
+)
+
+
+print(
+    "\n✓ historical seasonal validation complete"
+)
+
+# ============================================================
+# CELL 17 — SEASONAL PERFORMANCE SUMMARY
+# ============================================================
+
+seasonal_summary = (
+
+    seasonal_results_df
+
+    .groupby(
+        "DOY"
+    )
+
+    .agg(
+
+        Mean_R2=(
+            "R2",
+            "mean"
+        ),
+
+        Median_R2=(
+            "R2",
+            "median"
+        ),
+
+        Mean_RMSE=(
+            "RMSE",
+            "mean"
+        ),
+
+        Mean_MAE=(
+            "MAE",
+            "mean"
+        ),
+
+        Years=(
+            "TestYear",
+            "count"
+        )
+
+    )
+
+    .reset_index()
+
+)
+
+
+display(
+    seasonal_summary
+)
+
+
+plt.figure(
+    figsize=(
+        11,
+        6
+    )
+)
+
+
+plt.plot(
+
+    seasonal_summary[
+        "DOY"
+    ],
+
+    seasonal_summary[
+        "Mean_R2"
+    ],
+
+    marker="o"
+
+)
+
+
+plt.xlabel(
+    "Day of Year"
+)
+
+plt.ylabel(
+    "Mean held-out-year R²"
+)
+
+plt.title(
+    "Same-Year CDL Historical Training — Seasonal Yield Performance"
+)
+
+plt.grid(
+    alpha=0.25
+)
+
+plt.tight_layout()
+
+plt.show()
+
+
+plt.figure(
+    figsize=(
+        11,
+        6
+    )
+)
+
+
+plt.plot(
+
+    seasonal_summary[
+        "DOY"
+    ],
+
+    seasonal_summary[
+        "Mean_RMSE"
+    ],
+
+    marker="o"
+
+)
+
+
+plt.xlabel(
+    "Day of Year"
+)
+
+plt.ylabel(
+    "Mean RMSE (bu/ac)"
+)
+
+plt.title(
+    "Seasonal Yield RMSE"
+)
+
+plt.grid(
+    alpha=0.25
+)
+
+plt.tight_layout()
+
+plt.show()
+
+# ============================================================
+
+# ============================================================
+# CANONICAL MODEL MANIFEST
+# ============================================================
+
+canonical_model_manifest = {
+
+    "model_version":
+        MODEL_VERSION,
+
+    "historical_training_mask":
+        "same-year final CDL",
+
+    "target":
+        "yield_anomaly = yield_bu_acre - hist_5yr",
+
+    "prediction_reconstruction":
+        "predicted_yield = hist_5yr + predicted_anomaly",
+
+    "vegetation_indices":
+        list(
+            VEG_INDICES
+        ),
+
+    "vegetation_anomalies":
+        "strict prior-year county/DOY expanding mean; current year excluded",
+
+    "explicit_predictors":
+        [
+            "hist_5yr",
+            "year"
+        ],
+
+    "compact_prism_features":
+        list(
+            BASE_ENV
+        ),
+
+    "excluded_environmental_blocks":
+        [
+            "PRISM weather anomalies",
+            "AWC100",
+            "AWC x stress interactions",
+            "SOC",
+            "CEC",
+            "LST"
+        ],
+
+    "xgboost":
+        dict(
+            XGB_PARAMS
+        ),
+
+    "validation":
+        "expanding-year held-out validation"
+
+}
+
+
+manifest_path = os.path.join(
+
+    OUTPUT_DIR_BASE,
+
+    "CY2_COMPACT_PRISM_CANONICAL_model_spec.json"
+
+)
+
+
+with open(
+    manifest_path,
+    "w",
+    encoding="utf-8"
+) as f:
+
+    import json
+
+    json.dump(
+        canonical_model_manifest,
+        f,
+        indent=2
+    )
+
+
+print(
+    "\n✓ canonical model manifest saved:"
+)
+
+print(
+    manifest_path
+)
+
+# ============================================================
+# CELL 18 — 2022–2025 DUAL-ALTERNATIVE DEPLOYMENT FRAMEWORK
+# ============================================================
+#
+# ENGINEERING DESIGN ALTERNATIVES
+# --------------------------------
+# Alternative A:
+#   Previous-season CDL vegetation information
+#
+# Alternative B:
+#   Our in-season ICDL vegetation information
+#   (June / July / August as available)
+#
+# REFERENCE / ORACLE (NOT A THIRD DESIGN ALTERNATIVE)
+# ----------------------------------------------------
+#   Final same-year CDL
+#
+# OPTIONAL SUPPLEMENTAL COMPARISON
+# ---------------------------------
+#   Published / Study ICDL June / July / August
+#
+# FAIR-COMPARISON RULES
+# ---------------------
+# • Test years = 2022, 2023, 2024, 2025.
+# • For test year Y, training uses only model_df rows with year < Y.
+# • Test-year vegetation never enters its anomaly baseline.
+# • XGBoost is trained once per test-year + DOY.
+# • Every scenario for that year + DOY uses that exact same fitted model.
+# • Training feature columns and training medians are frozen before testing.
+# • All scenarios within a test year use the same common county set.
+# • PRISM/weather and yield information are held constant across scenarios.
+# • Final CDL is a same-year reference/oracle, not Alternative C.
+# • Published/Study ICDL is supplemental and does not redefine the two
+#   engineering alternatives.
+# • Missing 2024/2025 scenario files are reported, never fabricated.
+#
+# PRIMARY QUESTION
+# ----------------
+# Does the proposed in-season ICDL alternative provide useful yield
+# information earlier in the growing season than the conventional
+# previous-season CDL alternative, under the same model/environment?
+# ============================================================
+
+import os
+import re
+import glob
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from scipy import stats
+from sklearn.metrics import (
+    r2_score,
+    mean_squared_error,
+    mean_absolute_error,
+)
+
+warnings.filterwarnings("ignore")
+
+print()
+print("=" * 110)
+print("CELL 18 — 2022–2025 DUAL-ALTERNATIVE DEPLOYMENT FRAMEWORK")
+print("=" * 110)
+
+# ------------------------------------------------------------
+# 1. VERIFY CELLS 1–17
+# ------------------------------------------------------------
+required_objects = [
+    "model_df",
+    "same_year_cdl_df",
+    "yield_features",
+    "environment",
+    "BASE_ENV",
+    "build_features",
+    "build_gee_wide",
+    "clean_fips",
+    "get_environment",
+    "make_model",
+]
+
+missing = [
+    name for name in required_objects
+    if name not in globals()
+]
+
+if missing:
+    raise RuntimeError(
+        "Cell 18 is missing objects from the canonical Cells 1–17:\n\n"
+        + "\n".join(missing)
+        + "\n\nRun Cells 1–17 first."
+    )
+
+print("✓ Cells 1–17 objects found")
+
+# ------------------------------------------------------------
+# 2. SETTINGS
+# ------------------------------------------------------------
+TEST_YEARS_CELL18 = [2022, 2023, 2024, 2025]
+
+CHECKPOINT_DOYS = {
+    "June": [161, 177],
+    "July": [193, 209],
+    "August": [225, 241, 257, 273],
+}
+
+# The explicit scenario directory supplied by the user.
+SCENARIO_DIR = os.path.join(
+    INPUT_DIR,
+    "04_MODIS_SCENARIOS",
+)
+
+OUTPUT_DIR_CELL18 = os.path.join(
+    OUTPUT_DIR_BASE,
+    "cell18_2022_2025_dual_alternative_results",
+)
+
+os.makedirs(
+    OUTPUT_DIR_CELL18,
+    exist_ok=True,
+)
+
+print("Scenario directory :", SCENARIO_DIR)
+print("Cell 18 output dir :", OUTPUT_DIR_CELL18)
+
+# ------------------------------------------------------------
+# 3. SCENARIO DISCOVERY
+# ------------------------------------------------------------
+#
+# Search both:
+#   1. the staged DATA_DIR
+#   2. the user's explicit local scenarios folder
+#
+# DATA_DIR is useful because Cell 2 stages every source CSV.
+# SCENARIO_DIR is included explicitly so the intended scenario
+# location is unambiguous.
+# ------------------------------------------------------------
+SEARCH_ROOTS_CELL18 = [
+    DATA_DIR,
+    SCENARIO_DIR,
+]
+
+all_scenario_csvs = []
+
+for root in SEARCH_ROOTS_CELL18:
+    if not os.path.exists(root):
+        continue
+
+    all_scenario_csvs.extend(
+        glob.glob(
+            os.path.join(
+                root,
+                "**",
+                "*.csv",
+            ),
+            recursive=True,
+        )
+    )
+
+all_scenario_csvs = sorted(
+    set(
+        os.path.abspath(p)
+        for p in all_scenario_csvs
+    )
+)
+
+print()
+print("=" * 100)
+print("SCENARIO DISCOVERY")
+print("=" * 100)
+print("Scenario CSV candidates:", len(all_scenario_csvs))
+
+# ------------------------------------------------------------
+# 4. NORMALIZE + PARSE SCENARIO FILENAMES
+# ------------------------------------------------------------
+def normalize_filename(path):
+    name = os.path.basename(path)
+    stem, ext = os.path.splitext(name)
+
+    # Handles browser duplicates:
+    #   file.csv
+    #   file (1).csv
+    #   file (2).csv
+    stem = re.sub(
+        r"\s*\(\d+\)$",
+        "",
+        stem,
+    )
+
+    return (
+        stem + ext
+    ).upper()
+
+
+SCENARIO_PATTERN = re.compile(
+    r"^CORN_MODIS_(2022|2023|2024|2025)_"
+    r"(PREVIOUS_CDL|FINAL_CDL|"
+    r"CROPSMART_(JUNE|JULY|AUGUST)_FIXED|"
+    r"CLEAN_REBUILT_(JUNE|JULY|AUGUST)|"
+    r"STUDY_(JUNE|JULY|AUGUST)|"
+    r"OUR_(JUNE|JULY|AUGUST))"
+    r"\.CSV$",
+    re.IGNORECASE,
+)
+
+
+def parse_scenario_file(path):
+    name = normalize_filename(path)
+
+    match = SCENARIO_PATTERN.match(name)
+
+    if match is None:
+        return None
+
+    year = int(
+        match.group(1)
+    )
+
+    token = (
+        match.group(2)
+        .upper()
+    )
+
+    if token == "PREVIOUS_CDL":
+        label = "Previous-year CDL"
+        family = "Previous"
+        checkpoint = None
+
+    elif token == "FINAL_CDL":
+        label = "Final CDL"
+        family = "Final"
+        checkpoint = None
+
+    elif token.startswith("CROPSMART_"):
+        checkpoint = (
+            token
+            .replace("CROPSMART_", "")
+            .replace("_FIXED", "")
+            .title()
+        )
+        label = (
+            "Our Clean "
+            + checkpoint
+        )
+        family = "Our Clean"
+
+    elif token.startswith("CLEAN_REBUILT_"):
+        # Legacy ICDL; superseded by CropSmart as the in-season
+        # alternative. Ignored so it cannot shrink the fair
+        # common-county set. Re-enable by returning a dict here.
+        return None
+
+    elif token.startswith("OUR_"):
+        # Legacy ICDL alias; superseded by CropSmart. Ignored.
+        return None
+
+    elif token.startswith("STUDY_"):
+        checkpoint = (
+            token
+            .replace(
+                "STUDY_",
+                "",
+            )
+            .title()
+        )
+        label = (
+            "Published "
+            + checkpoint
+        )
+        family = "Published"
+
+    else:
+        return None
+
+    return {
+        "year": year,
+        "label": label,
+        "family": family,
+        "checkpoint": checkpoint,
+        "path": path,
+    }
+
+
+parsed_candidates = []
+
+for path in all_scenario_csvs:
+    parsed = parse_scenario_file(path)
+    if parsed is not None:
+        parsed_candidates.append(parsed)
+
+if not parsed_candidates:
+    raise FileNotFoundError(
+        "No recognized 2022–2025 scenario CSVs were detected.\n"
+        f"Expected files under:\n{SCENARIO_DIR}\n\n"
+        "Recognized patterns include:\n"
+        "  Corn_MODIS_2022_PREVIOUS_CDL.csv\n"
+        "  Corn_MODIS_2022_FINAL_CDL.csv\n"
+        "  Corn_MODIS_2022_CLEAN_REBUILT_JUNE.csv\n"
+        "  Corn_MODIS_2022_CLEAN_REBUILT_JULY.csv\n"
+        "  Corn_MODIS_2022_CLEAN_REBUILT_AUGUST.csv\n"
+        "and equivalent 2023–2025 files."
+    )
+
+# ------------------------------------------------------------
+# 5. REMOVE DUPLICATE COPIES
+# ------------------------------------------------------------
+scenario_info = {}
+
+for item in parsed_candidates:
+    key = (
+        item["year"],
+        item["label"],
+    )
+
+    if key not in scenario_info:
+        scenario_info[key] = item
+        continue
+
+    old_path = scenario_info[key]["path"]
+
+    # Prefer the newest copy.
+    if (
+        os.path.getmtime(item["path"])
+        >
+        os.path.getmtime(old_path)
+    ):
+        scenario_info[key] = item
+
+print()
+print("=" * 100)
+print("SCENARIO FILES DETECTED")
+print("=" * 100)
+
+for key in sorted(scenario_info.keys()):
+    item = scenario_info[key]
+    print(
+        f"{item['year']} | "
+        f"{item['label']:24s} | "
+        f"{os.path.basename(item['path'])}"
+    )
+
+# ------------------------------------------------------------
+# 6. YEAR-BY-YEAR INVENTORY / MISSING DATA REPORT
+# ------------------------------------------------------------
+required_for_dual = [
+    "Previous-year CDL",
+    "Our Clean June",
+    "Our Clean July",
+    "Our Clean August",
+]
+
+for year in TEST_YEARS_CELL18:
+    present = {
+        label
+        for (yr, label) in scenario_info.keys()
+        if yr == year
+    }
+
+    print()
+    print(f"{year} scenario inventory:")
+
+    for label in required_for_dual:
+        status = "FOUND" if label in present else "MISSING"
+        print(
+            f"  {status:7s} | {label}"
+        )
+
+    final_status = (
+        "FOUND"
+        if "Final CDL" in present
+        else "MISSING"
+    )
+    print(
+        f"  {final_status:7s} | Final CDL reference/oracle"
+    )
+
+    for checkpoint in ["June", "July", "August"]:
+        label = "Published " + checkpoint
+        if label in present:
+            print(
+                f"  FOUND   | {label} supplemental"
+            )
+
+# ------------------------------------------------------------
+# 7. LOAD SCENARIO CSVs -> WIDE COUNTY TABLES
+# ------------------------------------------------------------
+scenario_raw_cell18 = {}
+
+for (
+    test_year,
+    scenario_label,
+), item in sorted(
+    scenario_info.items()
+):
+    print()
+    print(
+        "Loading:",
+        test_year,
+        scenario_label,
+    )
+
+    wide = build_gee_wide(
+        [item["path"]],
+        label=(
+            f"{test_year} "
+            f"{scenario_label}"
+        ),
+        force_year=test_year,
+    )
+
+    if wide.empty:
+        print(
+            "  ⚠ Empty scenario after loading."
+        )
+        continue
+
+    if "FIPS" not in wide.columns:
+        if "GEOID" in wide.columns:
+            wide = wide.rename(
+                columns={
+                    "GEOID": "FIPS"
+                }
+            )
+        else:
+            raise KeyError(
+                f"{scenario_label}: "
+                "no FIPS/GEOID after conversion."
+            )
+
+    wide["FIPS"] = clean_fips(
+        wide["FIPS"]
+    )
+
+    wide["year"] = pd.to_numeric(
+        wide["year"],
+        errors="coerce",
+    )
+
+    wide = wide[
+        wide["year"] == test_year
+    ].copy()
+
+    if wide.empty:
+        print(
+            "  ⚠ No rows for expected test year."
+        )
+        continue
+
+    wide["year"] = wide["year"].astype(int)
+
+    wide = (
+        wide
+        .drop_duplicates(
+            subset=["FIPS", "year"]
+        )
+        .reset_index(drop=True)
+    )
+
+    scenario_raw_cell18[
+        (
+            test_year,
+            scenario_label,
+        )
+    ] = wide
+
+    print(
+        "  counties:",
+        wide["FIPS"].nunique(),
+    )
+
+# ------------------------------------------------------------
+# 8. YIELD LOOKUP
+# ------------------------------------------------------------
+yield_lookup_cell18 = (
+    yield_features[
+        [
+            "FIPS",
+            "year",
+            "yield_bu_acre",
+            "hist_5yr",
+            "yield_anomaly",
+        ]
+    ]
+    .copy()
+)
+
+yield_lookup_cell18["FIPS"] = clean_fips(
+    yield_lookup_cell18["FIPS"]
+)
+
+yield_lookup_cell18["year"] = pd.to_numeric(
+    yield_lookup_cell18["year"],
+    errors="coerce",
+)
+
+yield_lookup_cell18 = (
+    yield_lookup_cell18[
+        yield_lookup_cell18["year"].notna()
+    ]
+    .copy()
+)
+
+yield_lookup_cell18["year"] = (
+    yield_lookup_cell18["year"]
+    .astype(int)
+)
+
+yield_lookup_cell18 = (
+    yield_lookup_cell18
+    .drop_duplicates(
+        subset=["FIPS", "year"]
+    )
+)
+
+# ------------------------------------------------------------
+# 9. HISTORICAL VEGETATION SOURCE
+# ------------------------------------------------------------
+#
+# Historical anomaly baselines are ALWAYS constructed from
+# years before the deployment year.
+#
+# Therefore:
+#   2022 -> vegetation years < 2022
+#   2023 -> vegetation years < 2023
+#   2024 -> vegetation years < 2024
+#   2025 -> vegetation years < 2025
+#
+# The deployment-year scenario itself never contributes to its
+# own anomaly baseline.
+# ------------------------------------------------------------
+same_year_hist_source = (
+    same_year_cdl_df
+    .copy()
+)
+
+same_year_hist_source["FIPS"] = clean_fips(
+    same_year_hist_source["FIPS"]
+)
+
+same_year_hist_source["year"] = pd.to_numeric(
+    same_year_hist_source["year"],
+    errors="coerce",
+)
+
+same_year_hist_source = (
+    same_year_hist_source[
+        same_year_hist_source["year"].notna()
+    ]
+    .copy()
+)
+
+same_year_hist_source["year"] = (
+    same_year_hist_source["year"]
+    .astype(int)
+)
+
+# ------------------------------------------------------------
+# 10. PREPARE SCENARIO WITH LEAKAGE-FREE VEGETATION ANOMALIES
+# ------------------------------------------------------------
+def prepare_test_scenario_cell18(
+    raw_test,
+    test_year,
+):
+    test = raw_test.copy()
+
+    test["FIPS"] = clean_fips(
+        test["FIPS"]
+    )
+
+    test["year"] = int(test_year)
+
+    test = test.merge(
+        yield_lookup_cell18,
+        on=["FIPS", "year"],
+        how="left",
+        validate="one_to_one",
+    )
+
+    hist = same_year_hist_source[
+        same_year_hist_source["year"] < test_year
+    ].copy()
+
+    for idx in VEG_INDICES:
+
+        raw_cols = [
+            col
+            for col in same_year_hist_source.columns
+            if (
+                col.startswith(
+                    idx + "_DOY_"
+                )
+                and not col.endswith("_anom")
+            )
+        ]
+
+        for col in raw_cols:
+
+            if col not in test.columns:
+                test[col] = np.nan
+
+            county_hist_mean = (
+                hist
+                .groupby("FIPS")[col]
+                .mean()
+            )
+
+            test[
+                col + "_anom"
+            ] = (
+                pd.to_numeric(
+                    test[col],
+                    errors="coerce",
+                )
+                -
+                test["FIPS"].map(
+                    county_hist_mean
+                )
+            )
+
+    return test
+
+
+scenario_test_cell18 = {}
+
+for (
+    test_year,
+    scenario_label,
+), raw in scenario_raw_cell18.items():
+
+    scenario_test_cell18[
+        (
+            test_year,
+            scenario_label,
+        )
+    ] = prepare_test_scenario_cell18(
+        raw,
+        test_year,
+    )
+
+# ------------------------------------------------------------
+# 11. FORCE FAIR COMMON COUNTY SET
+# ------------------------------------------------------------
+#
+# Within each test year, every scenario is evaluated on exactly
+# the same counties:
+#
+#   yield exists
+#   hist_5yr exists
+#   scenario vegetation exists
+#
+# Different test years may have different common county counts.
+# ------------------------------------------------------------
+common_fips_by_year_cell18 = {}
+
+for test_year in TEST_YEARS_CELL18:
+
+    year_keys = [
+        key
+        for key in scenario_test_cell18.keys()
+        if key[0] == test_year
+    ]
+
+    if not year_keys:
+        print(
+            f"\n{test_year}: no recognized scenarios."
+        )
+        continue
+
+    valid_yield_fips = set(
+        yield_lookup_cell18.loc[
+            (
+                (yield_lookup_cell18["year"] == test_year)
+                &
+                yield_lookup_cell18["yield_bu_acre"].notna()
+                &
+                yield_lookup_cell18["hist_5yr"].notna()
+            ),
+            "FIPS",
+        ]
+    )
+
+    common_fips = valid_yield_fips.copy()
+
+    for key in year_keys:
+        common_fips &= set(
+            scenario_test_cell18[
+                key
+            ]["FIPS"]
+        )
+
+    common_fips = sorted(
+        common_fips
+    )
+
+    common_fips_by_year_cell18[
+        test_year
+    ] = common_fips
+
+    print(
+        f"\n{test_year} common comparison counties:",
+        len(common_fips),
+    )
+
+    for key in year_keys:
+        scenario_test_cell18[
+            key
+        ] = (
+            scenario_test_cell18[key]
+            [
+                scenario_test_cell18[key]["FIPS"]
+                .isin(common_fips)
+            ]
+            .sort_values("FIPS")
+            .reset_index(drop=True)
+        )
+
+# ------------------------------------------------------------
+# 12. SCENARIO HELPERS
+# ------------------------------------------------------------
+def scenario_exists_cell18(
+    year,
+    label,
+):
+    return (
+        year,
+        label,
+    ) in scenario_test_cell18
+
+
+def checkpoint_for_doy(doy):
+    for checkpoint, doys in CHECKPOINT_DOYS.items():
+        if doy in doys:
+            return checkpoint
+    return None
+
+
+def scenario_for_family_cell18(
+    year,
+    family,
+    doy,
+):
+    checkpoint = checkpoint_for_doy(doy)
+
+    if checkpoint is None:
+        return None
+
+    if family == "Our Clean":
+        label = (
+            "Our Clean "
+            + checkpoint
+        )
+    elif family == "Published":
+        label = (
+            "Published "
+            + checkpoint
+        )
+    else:
+        return None
+
+    if scenario_exists_cell18(
+        year,
+        label,
+    ):
+        return label
+
+    return None
+
+
+def available_doys_for_year_cell18(
+    year,
+):
+    doys = []
+
+    for checkpoint, checkpoint_doys in CHECKPOINT_DOYS.items():
+
+        our_label = (
+            "Our Clean "
+            + checkpoint
+        )
+
+        if scenario_exists_cell18(
+            year,
+            our_label,
+        ):
+            doys.extend(
+                checkpoint_doys
+            )
+
+    # If our ICDL is absent for a checkpoint but a published
+    # Study ICDL exists, keep that checkpoint available for the
+    # supplemental published comparison.
+    for checkpoint, checkpoint_doys in CHECKPOINT_DOYS.items():
+
+        published_label = (
+            "Published "
+            + checkpoint
+        )
+
+        if scenario_exists_cell18(
+            year,
+            published_label,
+        ):
+            doys.extend(
+                checkpoint_doys
+            )
+
+    return sorted(
+        set(doys)
+    )
+
+# ------------------------------------------------------------
+# 13. FROZEN MODEL FEATURE SPACE
+# ------------------------------------------------------------
+LEAKAGE_COLS_CELL18 = [
+    "yield_bu_acre",
+    "yield_filled",
+    "yield_anomaly",
+    "target",
+    "yield",
+]
+
+
+def build_frozen_training_matrix_cell18(
+    train_rows,
+    doy,
+):
+    Xveg = build_features(
+        train_rows,
+        doy,
+    )
+
+    Xenv = get_environment(
+        train_rows,
+        doy,
+    )
+
+    X = pd.concat(
+        [
+            Xveg,
+            Xenv,
+        ],
+        axis=1,
+    )
+
+    X = X.loc[
+        :,
+        ~X.columns.duplicated()
+    ]
+
+    X = X.drop(
+        columns=LEAKAGE_COLS_CELL18,
+        errors="ignore",
+    )
+
+    X["hist_5yr"] = (
+        train_rows["hist_5yr"].values
+    )
+
+    X["year"] = (
+        train_rows["year"]
+        .astype(float)
+        .values
+    )
+
+    X = X.select_dtypes(
+        include=[
+            np.number,
+            "bool",
+        ]
+    )
+
+    X = X.replace(
+        [
+            np.inf,
+            -np.inf,
+        ],
+        np.nan,
+    )
+
+    useful = X.notna().any(
+        axis=0
+    )
+
+    X = X.loc[
+        :,
+        useful,
+    ].copy()
+
+    medians = X.median()
+
+    good_cols = medians.notna()
+
+    X = X.loc[
+        :,
+        good_cols,
+    ].copy()
+
+    medians = medians.loc[
+        good_cols
+    ]
+
+    X = X.fillna(
+        medians
+    )
+
+    return (
+        X,
+        list(X.columns),
+        medians,
+    )
+
+
+def build_frozen_test_matrix_cell18(
+    test_rows,
+    doy,
+    training_columns,
+    training_medians,
+):
+    Xveg = build_features(
+        test_rows,
+        doy,
+    )
+
+    Xenv = get_environment(
+        test_rows,
+        doy,
+    )
+
+    X = pd.concat(
+        [
+            Xveg,
+            Xenv,
+        ],
+        axis=1,
+    )
+
+    X = X.loc[
+        :,
+        ~X.columns.duplicated()
+    ]
+
+    X = X.drop(
+        columns=LEAKAGE_COLS_CELL18,
+        errors="ignore",
+    )
+
+    X["hist_5yr"] = (
+        test_rows["hist_5yr"].values
+    )
+
+    X["year"] = (
+        test_rows["year"]
+        .astype(float)
+        .values
+    )
+
+    X = X.select_dtypes(
+        include=[
+            np.number,
+            "bool",
+        ]
+    )
+
+    X = X.replace(
+        [
+            np.inf,
+            -np.inf,
+        ],
+        np.nan,
+    )
+
+    X = X.reindex(
+        columns=training_columns
+    )
+
+    X = X.fillna(
+        training_medians
+    )
+
+    return X
+
+# ------------------------------------------------------------
+# 14. DAVIDSON–MACKINNON J-TEST
+# ------------------------------------------------------------
+def davidson_mackinnon_jtest(
+    y_true,
+    y_pred_a,
+    y_pred_b,
+    label_a="Previous CDL",
+    label_b="Our ICDL",
+    groups=None,
+):
+    """Forecast-encompassing J-test between two out-of-sample forecasts.
+
+    Regresses y on [1, y_a, y_b] (and the mirror) and tests each forecast's
+    coefficient. If groups is given, standard errors are cluster-robust
+    (CR1) with (G - 1) degrees of freedom, accounting for within-group
+    (e.g. within-state) correlation among county residuals. Without it,
+    classical OLS errors are used (independence assumed).
+    """
+    y = np.asarray(y_true, dtype=float)
+    y_a = np.asarray(y_pred_a, dtype=float)
+    y_b = np.asarray(y_pred_b, dtype=float)
+
+    mask = np.isfinite(y) & np.isfinite(y_a) & np.isfinite(y_b)
+    y, y_a, y_b = y[mask], y_a[mask], y_b[mask]
+    g = np.asarray(groups)[mask] if groups is not None else None
+
+    n = len(y)
+    if n < 10:
+        return {"n_obs": n, "verdict": "Insufficient observations"}
+
+    def _fit(X):
+        beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+        resid = y - X @ beta
+        k = X.shape[1]
+        try:
+            XtX_inv = np.linalg.inv(X.T @ X)
+        except np.linalg.LinAlgError:
+            return None
+        if g is None:
+            dof = n - k
+            mse = np.sum(resid ** 2) / dof
+            cov = mse * XtX_inv
+            n_clusters = None
+        else:
+            uniq = np.unique(g)
+            n_clusters = len(uniq)
+            meat = np.zeros((k, k))
+            for cl in uniq:
+                idx = (g == cl)
+                s = X[idx].T @ resid[idx]
+                meat += np.outer(s, s)
+            adj = (n_clusters / max(n_clusters - 1, 1)) * ((n - 1) / (n - k))
+            cov = adj * (XtX_inv @ meat @ XtX_inv)
+            dof = max(n_clusters - 1, 1)
+        return beta, cov, dof, n_clusters
+
+    fit_a = _fit(np.column_stack([np.ones(n), y_a, y_b]))  # null = Alt A
+    fit_b = _fit(np.column_stack([np.ones(n), y_b, y_a]))  # null = Alt B
+    if fit_a is None or fit_b is None:
+        return {"n_obs": n, "verdict": "Singular J-test design matrix"}
+
+    beta_a, cov_a, df_a, n_clusters = fit_a
+    beta_b, cov_b, df_b, _ = fit_b
+
+    se_b = np.sqrt(max(cov_a[2, 2], 1e-12))
+    t_stat_b = beta_a[2] / se_b
+    p_val_b = 2 * (1 - stats.t.cdf(abs(t_stat_b), df=df_a))
+
+    se_a = np.sqrt(max(cov_b[2, 2], 1e-12))
+    t_stat_a = beta_b[2] / se_a
+    p_val_a = 2 * (1 - stats.t.cdf(abs(t_stat_a), df=df_b))
+
+    reject_a = bool(p_val_b < 0.05)
+    reject_b = bool(p_val_a < 0.05)
+
+    if reject_a and not reject_b:
+        verdict = f"{label_b} provides unique information relative to {label_a}"
+    elif reject_b and not reject_a:
+        verdict = f"{label_a} provides unique information relative to {label_b}"
+    elif reject_a and reject_b:
+        verdict = "Both alternatives carry unique information"
+    else:
+        verdict = "No statistically significant unique information detected by the J-test"
+
+    return {
+        "n_obs": n,
+        "alpha_b": beta_a[2],
+        "t_stat_b": t_stat_b,
+        "p_val_b": p_val_b,
+        "reject_null_a": reject_a,
+        "alpha_a": beta_b[2],
+        "t_stat_a": t_stat_a,
+        "p_val_a": p_val_a,
+        "reject_null_b": reject_b,
+        "se_type": "cluster-robust (CR1, by state)" if g is not None else "OLS",
+        "n_clusters": n_clusters,
+        "verdict": verdict,
+    }
+
+
+# ------------------------------------------------------------
+# 15. RUN THE TWO ENGINEERING ALTERNATIVES
+# ------------------------------------------------------------
+#
+# Alternative A:
+#   Previous-season CDL
+#
+# Alternative B:
+#   Our in-season ICDL
+#
+# Reference:
+#   Final same-year CDL
+#
+# Supplemental:
+#   Published Study ICDL
+# ------------------------------------------------------------
+results_cell18 = []
+prediction_store_cell18 = {}
+jtest_results_cell18 = []
+
+print()
+print("=" * 110)
+print("RUNNING 2022–2025 DUAL-ALTERNATIVE COMPARISON")
+print("=" * 110)
+
+for test_year in TEST_YEARS_CELL18:
+
+    year_keys = [
+        key
+        for key in scenario_test_cell18.keys()
+        if key[0] == test_year
+    ]
+
+    if not year_keys:
+        print(
+            f"\n{test_year}: SKIPPED — no scenario files detected."
+        )
+        continue
+
+    eval_doys = available_doys_for_year_cell18(
+        test_year
+    )
+
+    if not eval_doys:
+        print(
+            f"\n{test_year}: SKIPPED — no June/July/August ICDL checkpoints detected."
+        )
+        continue
+
+    train_rows = model_df[
+        (
+            model_df["year"]
+            <
+            test_year
+        )
+        &
+        model_df["yield_bu_acre"].notna()
+        &
+        model_df["hist_5yr"].notna()
+    ].copy()
+
+    if train_rows.empty:
+        print(
+            f"\n{test_year}: SKIPPED — no prior-year training data."
+        )
+        continue
+
+    print()
+    print("#" * 110)
+    print(
+        f"TEST YEAR {test_year}"
+    )
+    print(
+        "Training years:",
+        int(train_rows["year"].min()),
+        "to",
+        int(train_rows["year"].max()),
+        "| training rows:",
+        f"{len(train_rows):,}",
+    )
+    print(
+        "Evaluation DOYs:",
+        eval_doys,
+    )
+    print("#" * 110)
+
+    for doy in eval_doys:
+
+        checkpoint = checkpoint_for_doy(
+            doy
+        )
+
+        print()
+        print(
+            f"DOY {doy} ({checkpoint})"
+        )
+
+        # ----------------------------------------------------
+        # TRAIN ONCE FOR THIS YEAR + DOY
+        # ----------------------------------------------------
+        (
+            X_train,
+            training_columns,
+            training_medians,
+        ) = build_frozen_training_matrix_cell18(
+            train_rows,
+            doy,
+        )
+
+        y_train = (
+            train_rows["yield_anomaly"]
+            .to_numpy()
+        )
+
+        model = make_model(
+            seed=42
+        )
+
+        model.fit(
+            X_train,
+            y_train,
+        )
+
+        # ----------------------------------------------------
+        # Determine scenarios active at this checkpoint
+        # ----------------------------------------------------
+        active_scenarios = []
+
+        if scenario_exists_cell18(
+            test_year,
+            "Previous-year CDL",
+        ):
+            active_scenarios.append(
+                (
+                    "Alternative A — Previous-season CDL",
+                    "Previous-year CDL",
+                    "Alternative A",
+                )
+            )
+
+        our_label = scenario_for_family_cell18(
+            test_year,
+            "Our Clean",
+            doy,
+        )
+
+        if our_label is not None:
+            active_scenarios.append(
+                (
+                    "Alternative B — In-season ICDL",
+                    our_label,
+                    "Alternative B",
+                )
+            )
+
+        final_available = scenario_exists_cell18(
+            test_year,
+            "Final CDL",
+        )
+
+        if final_available:
+            active_scenarios.append(
+                (
+                    "Reference — Final same-year CDL",
+                    "Final CDL",
+                    "Reference",
+                )
+            )
+
+        published_label = scenario_for_family_cell18(
+            test_year,
+            "Published",
+            doy,
+        )
+
+        if published_label is not None:
+            active_scenarios.append(
+                (
+                    "Supplemental — Published ICDL",
+                    published_label,
+                    "Supplemental",
+                )
+            )
+
+        if not active_scenarios:
+            print(
+                "  No active scenario at this checkpoint."
+            )
+            continue
+
+        predictions_for_jtest = {}
+
+        # ----------------------------------------------------
+        # SAME MODEL FOR ALL SCENARIOS
+        # ----------------------------------------------------
+        for (
+            result_label,
+            source_label,
+            role,
+        ) in active_scenarios:
+
+            test_rows = (
+                scenario_test_cell18[
+                    (
+                        test_year,
+                        source_label,
+                    )
+                ]
+                .copy()
+            )
+
+            X_test = build_frozen_test_matrix_cell18(
+                test_rows=test_rows,
+                doy=doy,
+                training_columns=training_columns,
+                training_medians=training_medians,
+            )
+
+            predicted_anomaly = model.predict(
+                X_test
+            )
+
+            predicted_yield = (
+                test_rows["hist_5yr"].to_numpy()
+                +
+                predicted_anomaly
+            )
+
+            actual_yield = (
+                test_rows["yield_bu_acre"].to_numpy()
+            )
+
+            eval_df = pd.DataFrame({
+                "FIPS": test_rows["FIPS"].to_numpy(),
+                "Test_Year": test_year,
+                "DOY": doy,
+                "Checkpoint": checkpoint,
+                "Actual_Yield": actual_yield,
+                "Predicted_Yield": predicted_yield,
+            })
+
+            eval_df = (
+                eval_df
+                .replace(
+                    [
+                        np.inf,
+                        -np.inf,
+                    ],
+                    np.nan,
+                )
+                .dropna(
+                    subset=[
+                        "Actual_Yield",
+                        "Predicted_Yield",
+                    ]
+                )
+                .copy()
+            )
+
+            if eval_df.empty:
+                print(
+                    f"  {result_label}: no valid prediction rows."
+                )
+                continue
+
+            actual = (
+                eval_df["Actual_Yield"]
+            )
+
+            pred = (
+                eval_df["Predicted_Yield"]
+            )
+
+            r2 = r2_score(
+                actual,
+                pred,
+            )
+
+            rmse = np.sqrt(
+                mean_squared_error(
+                    actual,
+                    pred,
+                )
+            )
+
+            mae = mean_absolute_error(
+                actual,
+                pred,
+            )
+
+            bias = float(
+                np.mean(
+                    pred - actual
+                )
+            )
+
+            results_cell18.append({
+                "Test_Year": test_year,
+                "DOY": doy,
+                "Checkpoint": checkpoint,
+                "Scenario": result_label,
+                "Role": role,
+                "Source_File_Scenario": source_label,
+                "R2": r2,
+                "RMSE": rmse,
+                "MAE": mae,
+                "Bias": bias,
+                "N": len(eval_df),
+                "N_Train": len(train_rows),
+                "N_Features": len(training_columns),
+            })
+
+            prediction_store_cell18[
+                (
+                    test_year,
+                    doy,
+                    result_label,
+                )
+            ] = eval_df
+
+            if role in [
+                "Alternative A",
+                "Alternative B",
+            ]:
+                predictions_for_jtest[
+                    role
+                ] = eval_df
+
+            print(
+                f"  {result_label:43s} "
+                f"R²={r2:.4f} | "
+                f"RMSE={rmse:.2f} | "
+                f"MAE={mae:.2f} | "
+                f"N={len(eval_df)}"
+            )
+
+        # ----------------------------------------------------
+        # J-TEST: ALTERNATIVE A vs ALTERNATIVE B
+        # ----------------------------------------------------
+        if (
+            "Alternative A"
+            in predictions_for_jtest
+            and
+            "Alternative B"
+            in predictions_for_jtest
+        ):
+
+            df_a = predictions_for_jtest[
+                "Alternative A"
+            ]
+
+            df_b = predictions_for_jtest[
+                "Alternative B"
+            ]
+
+            merged = df_a[
+                [
+                    "FIPS",
+                    "Actual_Yield",
+                    "Predicted_Yield",
+                ]
+            ].merge(
+                df_b[
+                    [
+                        "FIPS",
+                        "Predicted_Yield",
+                    ]
+                ],
+                on="FIPS",
+                suffixes=(
+                    "_A",
+                    "_B",
+                ),
+            )
+
+            if len(merged) >= 10:
+
+                _fips_str = (
+                    merged["FIPS"].astype(str).str.zfill(5)
+                )
+                _state_groups = _fips_str.str[:2].to_numpy()
+
+                j_res = davidson_mackinnon_jtest(
+                    y_true=merged["Actual_Yield"],
+                    y_pred_a=merged["Predicted_Yield_A"],
+                    y_pred_b=merged["Predicted_Yield_B"],
+                    label_a="Alternative A — Previous-season CDL",
+                    label_b="Alternative B — In-season ICDL",
+                    groups=_state_groups,
+                )
+
+                jtest_results_cell18.append({
+                    "Test_Year": test_year,
+                    "DOY": doy,
+                    "Checkpoint": checkpoint,
+                    "N_Counties": j_res["n_obs"],
+                    "Alpha_ICDL": j_res.get(
+                        "alpha_b",
+                        np.nan,
+                    ),
+                    "t_stat_ICDL": j_res.get(
+                        "t_stat_b",
+                        np.nan,
+                    ),
+                    "p_val_ICDL": j_res.get(
+                        "p_val_b",
+                        np.nan,
+                    ),
+                    "Reject_Previous_CDL": j_res.get(
+                        "reject_null_a",
+                        np.nan,
+                    ),
+                    "Alpha_Previous": j_res.get(
+                        "alpha_a",
+                        np.nan,
+                    ),
+                    "t_stat_Previous": j_res.get(
+                        "t_stat_a",
+                        np.nan,
+                    ),
+                    "p_val_Previous": j_res.get(
+                        "p_val_a",
+                        np.nan,
+                    ),
+                    "Reject_InSeason_ICDL": j_res.get(
+                        "reject_null_b",
+                        np.nan,
+                    ),
+                    "SE_Type": j_res.get(
+                        "se_type",
+                        "",
+                    ),
+                    "N_Clusters": j_res.get(
+                        "n_clusters",
+                        np.nan,
+                    ),
+                    "Verdict": j_res.get(
+                        "verdict",
+                        "",
+                    ),
+                })
+
+                print(
+                    "  J-test:",
+                    j_res["verdict"],
+                )
+
+# ------------------------------------------------------------
+# 16. RESULTS TABLES
+# ------------------------------------------------------------
+results_cell18 = pd.DataFrame(
+    results_cell18
+)
+
+jtest_results_cell18 = pd.DataFrame(
+    jtest_results_cell18
+)
+
+if results_cell18.empty:
+    raise RuntimeError(
+        "No dual-alternative Cell 18 results were produced."
+    )
+
+# Wide R² / RMSE / MAE tables.
+r2_table_cell18 = (
+    results_cell18
+    .pivot_table(
+        index=[
+            "Test_Year",
+            "DOY",
+            "Checkpoint",
+        ],
+        columns="Scenario",
+        values="R2",
+        aggfunc="first",
+    )
+    .reset_index()
+)
+
+rmse_table_cell18 = (
+    results_cell18
+    .pivot_table(
+        index=[
+            "Test_Year",
+            "DOY",
+            "Checkpoint",
+        ],
+        columns="Scenario",
+        values="RMSE",
+        aggfunc="first",
+    )
+    .reset_index()
+)
+
+mae_table_cell18 = (
+    results_cell18
+    .pivot_table(
+        index=[
+            "Test_Year",
+            "DOY",
+            "Checkpoint",
+        ],
+        columns="Scenario",
+        values="MAE",
+        aggfunc="first",
+    )
+    .reset_index()
+)
+
+# ------------------------------------------------------------
+# 17. PRIMARY ALTERNATIVE COMPARISON
+# ------------------------------------------------------------
+#
+# This is the main engineering-design comparison:
+#
+#   Alternative B - Alternative A
+#
+# Positive ΔR² means the ICDL alternative has higher R² at that
+# checkpoint; negative means lower. We do not collapse this into
+# a single score.
+# ------------------------------------------------------------
+alt_a = (
+    "Alternative A — Previous-season CDL"
+)
+
+alt_b = (
+    "Alternative B — In-season ICDL"
+)
+
+primary_comparison_rows = []
+
+for _, row in r2_table_cell18.iterrows():
+
+    out = {
+        "Test_Year": row["Test_Year"],
+        "DOY": row["DOY"],
+        "Checkpoint": row["Checkpoint"],
+        "Alternative_A_R2": row.get(
+            alt_a,
+            np.nan,
+        ),
+        "Alternative_B_R2": row.get(
+            alt_b,
+            np.nan,
+        ),
+    }
+
+    out[
+        "Delta_R2_B_minus_A"
+    ] = (
+        out["Alternative_B_R2"]
+        -
+        out["Alternative_A_R2"]
+        if (
+            pd.notna(out["Alternative_A_R2"])
+            and
+            pd.notna(out["Alternative_B_R2"])
+        )
+        else np.nan
+    )
+
+    primary_comparison_rows.append(
+        out
+    )
+
+primary_comparison = pd.DataFrame(
+    primary_comparison_rows
+)
+
+# Add RMSE comparison.
+rmse_a = (
+    rmse_table_cell18[
+        [
+            "Test_Year",
+            "DOY",
+            "Checkpoint",
+            alt_a,
+        ]
+    ]
+    .rename(
+        columns={
+            alt_a:
+                "Alternative_A_RMSE"
+        }
+    )
+)
+
+rmse_b = (
+    rmse_table_cell18[
+        [
+            "Test_Year",
+            "DOY",
+            "Checkpoint",
+            alt_b,
+        ]
+    ]
+    .rename(
+        columns={
+            alt_b:
+                "Alternative_B_RMSE"
+        }
+    )
+)
+
+primary_comparison = (
+    primary_comparison
+    .merge(
+        rmse_a,
+        on=[
+            "Test_Year",
+            "DOY",
+            "Checkpoint",
+        ],
+        how="left",
+    )
+    .merge(
+        rmse_b,
+        on=[
+            "Test_Year",
+            "DOY",
+            "Checkpoint",
+        ],
+        how="left",
+    )
+)
+
+primary_comparison[
+    "Delta_RMSE_B_minus_A"
+] = (
+    primary_comparison[
+        "Alternative_B_RMSE"
+    ]
+    -
+    primary_comparison[
+        "Alternative_A_RMSE"
+    ]
+)
+
+# ------------------------------------------------------------
+# 18. FINAL CDL REFERENCE / ORACLE COMPARISON
+# ------------------------------------------------------------
+oracle_label = (
+    "Reference — Final same-year CDL"
+)
+
+oracle_comparison_rows = []
+
+for _, row in r2_table_cell18.iterrows():
+
+    if oracle_label not in row.index:
+        continue
+
+    if alt_a not in row.index:
+        continue
+
+    oracle_comparison_rows.append({
+        "Test_Year": row["Test_Year"],
+        "DOY": row["DOY"],
+        "Checkpoint": row["Checkpoint"],
+        "Previous_CDL_R2": row.get(
+            alt_a,
+            np.nan,
+        ),
+        "InSeason_ICDL_R2": row.get(
+            alt_b,
+            np.nan,
+        ),
+        "Final_CDL_R2": row.get(
+            oracle_label,
+            np.nan,
+        ),
+    })
+
+oracle_comparison = pd.DataFrame(
+    oracle_comparison_rows
+)
+
+if not oracle_comparison.empty:
+
+    oracle_comparison[
+        "ICDL_minus_Previous_R2"
+    ] = (
+        oracle_comparison[
+            "InSeason_ICDL_R2"
+        ]
+        -
+        oracle_comparison[
+            "Previous_CDL_R2"
+        ]
+    )
+
+    oracle_comparison[
+        "Final_minus_Previous_R2"
+    ] = (
+        oracle_comparison[
+            "Final_CDL_R2"
+        ]
+        -
+        oracle_comparison[
+            "Previous_CDL_R2"
+        ]
+    )
+
+# ------------------------------------------------------------
+# 19. SAVE MACHINE-READABLE RESULTS
+# ------------------------------------------------------------
+results_path = os.path.join(
+    OUTPUT_DIR_CELL18,
+    "cell18_2022_2025_dual_alternative_all_results.csv",
+)
+
+r2_path = os.path.join(
+    OUTPUT_DIR_CELL18,
+    "cell18_2022_2025_R2_comparison.csv",
+)
+
+rmse_path = os.path.join(
+    OUTPUT_DIR_CELL18,
+    "cell18_2022_2025_RMSE_comparison.csv",
+)
+
+mae_path = os.path.join(
+    OUTPUT_DIR_CELL18,
+    "cell18_2022_2025_MAE_comparison.csv",
+)
+
+primary_path = os.path.join(
+    OUTPUT_DIR_CELL18,
+    "cell18_2022_2025_PRIMARY_AlternativeA_vs_B.csv",
+)
+
+oracle_path = os.path.join(
+    OUTPUT_DIR_CELL18,
+    "cell18_2022_2025_FINAL_CDL_reference.csv",
+)
+
+jtest_path = os.path.join(
+    OUTPUT_DIR_CELL18,
+    "cell18_2022_2025_Davidson_MacKinnon_JTest.csv",
+)
+
+inventory_path = os.path.join(
+    OUTPUT_DIR_CELL18,
+    "cell18_2022_2025_scenario_inventory.csv",
+)
+
+results_cell18.to_csv(
+    results_path,
+    index=False,
+)
+
+r2_table_cell18.to_csv(
+    r2_path,
+    index=False,
+)
+
+rmse_table_cell18.to_csv(
+    rmse_path,
+    index=False,
+)
+
+mae_table_cell18.to_csv(
+    mae_path,
+    index=False,
+)
+
+primary_comparison.to_csv(
+    primary_path,
+    index=False,
+)
+
+if not oracle_comparison.empty:
+    oracle_comparison.to_csv(
+        oracle_path,
+        index=False,
+    )
+
+if not jtest_results_cell18.empty:
+    jtest_results_cell18.to_csv(
+        jtest_path,
+        index=False,
+    )
+
+inventory_rows = []
+
+for year in TEST_YEARS_CELL18:
+
+    labels = sorted([
+        label
+        for (
+            yr,
+            label,
+        ) in scenario_info.keys()
+        if yr == year
+    ])
+
+    inventory_rows.append({
+        "Test_Year": year,
+        "Previous_CDL": (
+            "FOUND"
+            if "Previous-year CDL" in labels
+            else "MISSING"
+        ),
+        "Our_Clean_June": (
+            "FOUND"
+            if "Our Clean June" in labels
+            else "MISSING"
+        ),
+        "Our_Clean_July": (
+            "FOUND"
+            if "Our Clean July" in labels
+            else "MISSING"
+        ),
+        "Our_Clean_August": (
+            "FOUND"
+            if "Our Clean August" in labels
+            else "MISSING"
+        ),
+        "Final_CDL": (
+            "FOUND"
+            if "Final CDL" in labels
+            else "MISSING"
+        ),
+        "Published_June": (
+            "FOUND"
+            if "Published June" in labels
+            else "MISSING"
+        ),
+        "Published_July": (
+            "FOUND"
+            if "Published July" in labels
+            else "MISSING"
+        ),
+        "Published_August": (
+            "FOUND"
+            if "Published August" in labels
+            else "MISSING"
+        ),
+        "Common_Counties": len(
+            common_fips_by_year_cell18.get(
+                year,
+                [],
+            )
+        ),
+    })
+
+inventory_df = pd.DataFrame(
+    inventory_rows
+)
+
+inventory_df.to_csv(
+    inventory_path,
+    index=False,
+)
+
+# ------------------------------------------------------------
+# 20. PLOTS FOR THE ENGINEERING DELIVERABLE
+# ------------------------------------------------------------
+#
+# Primary plot:
+#   Alternative A vs Alternative B
+#
+# Reference plot:
+#   Alternative A vs Alternative B vs Final CDL oracle
+#
+# One plot per test year.
+# ------------------------------------------------------------
+for test_year in TEST_YEARS_CELL18:
+
+    year_results = results_cell18[
+        results_cell18["Test_Year"] == test_year
+    ].copy()
+
+    if year_results.empty:
+        continue
+
+    plt.figure(
+        figsize=(11, 6)
+    )
+
+    for scenario in [
+        alt_a,
+        alt_b,
+        oracle_label,
+    ]:
+
+        temp = (
+            year_results[
+                year_results["Scenario"] == scenario
+            ]
+            .sort_values("DOY")
+        )
+
+        if temp.empty:
+            continue
+
+        plt.plot(
+            temp["DOY"],
+            temp["R2"],
+            marker="o",
+            linewidth=2,
+            label=scenario,
+        )
+
+    plt.xlabel(
+        "Day of Year"
+    )
+
+    plt.ylabel(
+        f"{test_year} county-level R²"
+    )
+
+    plt.title(
+        f"{test_year}: "
+        "Previous-season CDL vs In-season ICDL "
+        "with Final CDL Reference"
+    )
+
+    plt.xticks(
+        sorted(
+            year_results["DOY"].unique()
+        )
+    )
+
+    plt.grid(
+        alpha=0.25
+    )
+
+    plt.legend()
+    plt.tight_layout()
+
+    plot_path = os.path.join(
+        OUTPUT_DIR_CELL18,
+        f"cell18_{test_year}_dual_alternative_R2.png",
+    )
+
+    plt.savefig(
+        plot_path,
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    plt.close()
+
+# ------------------------------------------------------------
+# 21. FINAL CONSOLE SUMMARY
+# ------------------------------------------------------------
+print()
+print("=" * 110)
+print("CELL 18 COMPLETE — DUAL-ALTERNATIVE FRAMEWORK")
+print("=" * 110)
+
+print(
+    "\nPRIMARY ALTERNATIVES:"
+)
+
+print(
+    "  Alternative A:",
+    alt_a,
+)
+
+print(
+    "  Alternative B:",
+    alt_b,
+)
+
+print(
+    "\nREFERENCE / ORACLE:"
+)
+
+print(
+    " ",
+    oracle_label,
+)
+
+print(
+    "\nSUPPLEMENTAL:"
+)
+
+print(
+    "  Published ICDL June / July / August, when supplied"
+)
+
+print(
+    "\nTest years attempted:",
+    TEST_YEARS_CELL18,
+)
+
+print(
+    "Test years with results:",
+    sorted(
+        results_cell18["Test_Year"]
+        .unique()
+    ),
+)
+
+print(
+    "\nAll results:"
+)
+
+print(
+    results_path
+)
+
+print(
+    "\nPrimary A-vs-B comparison:"
+)
+
+print(
+    primary_path
+)
+
+print(
+    "\nFinal CDL reference comparison:"
+)
+
+print(
+    oracle_path
+)
+
+print(
+    "\nJ-test:"
+)
+
+print(
+    jtest_path
+)
+
+print(
+    "\nScenario inventory:"
+)
+
+print(
+    inventory_path
+)
+
+print()
+print("=" * 110)
+print(
+    "IMPORTANT: A missing 2024/2025 scenario file is reported as missing."
+)
+print(
+    "The script does NOT fabricate missing deployment scenarios."
+)
+print("=" * 110)

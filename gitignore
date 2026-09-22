@@ -1,0 +1,54 @@
+# ---- Data: never commit (large / not redistributable) ----
+# Numbered project data folders
+02_CDL_RASTERS/
+03_CORN_MASKS/
+04_MODIS_SCENARIOS/
+05_WEATHER_PRISM/
+06_SOIL/
+07_YIELD/
+08_BOUNDARIES/
+10_MODEL_WORK/
+11_MODEL_RESULTS/
+13_QC/
+14_ARCHIVE/
+
+# Geospatial / raster / large data by extension
+*.tif
+*.tiff
+*.img
+*.vrt
+*.hdf
+*.nc
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.sbn
+*.sbx
+*.gpkg
+*.geojson
+*.zip
+*.7z
+*.gz
+
+# Raw MODIS/CDL data CSVs are large — ignore by default.
+# To version a specific small results CSV, force-add it:
+#   git add -f path/to/small_result.csv
+*.csv
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+.env
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
