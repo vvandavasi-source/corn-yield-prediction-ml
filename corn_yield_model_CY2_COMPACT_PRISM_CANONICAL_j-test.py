@@ -4402,7 +4402,7 @@ import warnings
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-
+import scipy.stats as stats
 from sklearn.metrics import (
     r2_score,
     mean_squared_error,
@@ -4486,7 +4486,7 @@ TEST_YEARS_CELL18 = [
 
     2022,
 
-    2023
+    2025
 
 ]
 
@@ -7445,6 +7445,84 @@ def davidson_mackinnon_jtest(y_true, y_pred_a, y_pred_b, label_a="Previous CDL",
         "verdict": verdict
     }
 
+# ------------------------------------------------------------
+# DIEBOLD-MARIANO TEST HELPER
+# ------------------------------------------------------------
+def diebold_mariano_test(
+    y_true, y_pred_a, y_pred_b, loss="squared", label_a="Previous CDL", label_b="Our ICDL"
+):
+    """
+    Diebold-Mariano test for equal predictive accuracy with Harvey-Leybourne-Newbold (HLN) correction.
+    
+    Loss choices:
+        - 'squared'  : compares Mean Squared Error (MSE)
+        - 'absolute' : compares Mean Absolute Error (MAE)
+        
+    Note on Sign:
+        d_i = Loss(Model A) - Loss(Model B)
+        Positive mean_diff (and positive DM stat) indicates Model B has lower loss (better performance).
+    """
+    y = np.asarray(y_true, dtype=float)
+    y_a = np.asarray(y_pred_a, dtype=float)
+    y_b = np.asarray(y_pred_b, dtype=float)
+
+    mask = np.isfinite(y) & np.isfinite(y_a) & np.isfinite(y_b)
+    y, y_a, y_b = y[mask], y_a[mask], y_b[mask]
+    n = len(y)
+
+    if n < 5:
+        return {"n_obs": n, "verdict": "Insufficient observations"}
+
+    e_a = y - y_a
+    e_b = y - y_b
+
+    if loss == "squared":
+        d = (e_a ** 2) - (e_b ** 2)
+    elif loss == "absolute":
+        d = np.abs(e_a) - np.abs(e_b)
+    else:
+        raise ValueError("Loss must be 'squared' or 'absolute'")
+
+    mean_d = np.mean(d)
+    var_d = np.var(d, ddof=1)
+
+    if var_d < 1e-12:
+        return {
+            "n_obs": n,
+            "loss_type": loss,
+            "mean_loss_diff": 0.0,
+            "dm_stat": 0.0,
+            "p_val": 1.0,
+            "verdict": "Identical predictions"
+        }
+
+    # Standard error of mean loss differential
+    se_d = np.sqrt(var_d / n)
+    dm_stat = mean_d / se_d
+
+    # Harvey, Leybourne, Newbold (1997) small-sample adjustment for 1-step forecasts
+    hln_mult = np.sqrt((n - 1) / n)
+    dm_stat_hln = dm_stat * hln_mult
+
+    # Two-tailed t-test p-value
+    p_val = 2 * (1 - stats.t.cdf(np.abs(dm_stat_hln), df=n - 1))
+
+    if p_val < 0.05:
+        if mean_d > 0:
+            verdict = f"{label_b} significantly outperforms {label_a} ({loss.upper()} loss)"
+        else:
+            verdict = f"{label_a} significantly outperforms {label_b} ({loss.upper()} loss)"
+    else:
+        verdict = f"No significant accuracy difference ({loss.upper()} loss)"
+
+    return {
+        "n_obs": n,
+        "loss_type": loss,
+        "mean_loss_diff": mean_d,
+        "dm_stat": dm_stat_hln,
+        "p_val": p_val,
+        "verdict": verdict
+    }
 
 # ------------------------------------------------------------
 # 2. DISCOVER & BUILD SCENARIO VEGETATION TABLES
@@ -7556,62 +7634,86 @@ for test_year in deployment_years:
                 "MAE": mae
             })
 
-        # ----------------------------------------------------
-        # RUN DAVIDSON-MACKINNON J-TEST (Previous CDL vs Our ICDL)
-        # ----------------------------------------------------
-        df_prev = predictions_by_scen["Previous CDL"]
-        df_icdl = predictions_by_scen["Our ICDL"]
+        # ------------------------------------------------------------
+        # PAIRWISE HYPOTHESIS TESTS (J-TEST & DIEBOLD-MARIANO)
+        # ------------------------------------------------------------
+        if "Previous CDL" in predictions_by_scen and "Our ICDL" in predictions_by_scen:
+            df_a = predictions_by_scen["Previous CDL"]
+            df_b = predictions_by_scen["Our ICDL"]
 
-        merged = df_prev.merge(
-            df_icdl[["FIPS", "pred_yield"]],
-            on="FIPS",
-            suffixes=("_prev", "_icdl")
-        ).dropna()
-
-        if len(merged) >= 10:
-            j_res = davidson_mackinnon_jtest(
-                y_true=merged["actual_yield"],
-                y_pred_a=merged["pred_yield_prev"],
-                y_pred_b=merged["pred_yield_icdl"],
-                label_a="Previous CDL",
-                label_b="Our ICDL"
+            merged = pd.merge(
+                df_a[["FIPS", "actual_yield", "pred_yield"]],
+                df_b[["FIPS", "pred_yield"]],
+                on="FIPS",
+                suffixes=("_prev", "_icdl")
             )
 
-            jtest_summary.append({
-                "Year": test_year,
-                "DOY": doy,
-                "N_Counties": j_res["n_obs"],
-                "Alpha_ICDL": j_res["alpha_b"],
-                "t_stat_ICDL": j_res["t_stat_b"],
-                "p_val_ICDL": j_res["p_val_b"],
-                "Reject_Prev_CDL": j_res["reject_null_a"],
-                "Alpha_Prev": j_res["alpha_a"],
-                "t_stat_Prev": j_res["t_stat_a"],
-                "p_val_Prev": j_res["p_val_a"],
-                "Reject_Our_ICDL": j_res["reject_null_b"],
-                "Verdict": j_res["verdict"]
-            })
+            if len(merged) >= 5:
+                # 1. Davidson-MacKinnon J-Test
+                j_res = davidson_mackinnon_jtest(
+                    merged["actual_yield"],
+                    merged["pred_yield_prev"],
+                    merged["pred_yield_icdl"],
+                    label_a="Previous CDL",
+                    label_b="Our ICDL"
+                )
 
-            print(f"DOY {doy:03d} | J-Test Verdict: {j_res['verdict']} (p_icdl={j_res['p_val_b']:.4f}, p_prev={j_res['p_val_a']:.4f})")
+                # 2. Diebold-Mariano Test (MSE Loss)
+                dm_mse = diebold_mariano_test(
+                    merged["actual_yield"],
+                    merged["pred_yield_prev"],
+                    merged["pred_yield_icdl"],
+                    loss="squared",
+                    label_a="Previous CDL",
+                    label_b="Our ICDL"
+                )
+
+                # 3. Diebold-Mariano Test (MAE Loss)
+                dm_mae = diebold_mariano_test(
+                    merged["actual_yield"],
+                    merged["pred_yield_prev"],
+                    merged["pred_yield_icdl"],
+                    loss="absolute",
+                    label_a="Previous CDL",
+                    label_b="Our ICDL"
+                )
+
+                jtest_summary.append({
+                    "Year": test_year,
+                    "DOY": doy,
+                    "N": j_res["n_obs"],
+                    "JTest_Verdict": j_res["verdict"],
+                    "DM_MSE_Stat": dm_mse["dm_stat"],
+                    "DM_MSE_pVal": dm_mse["p_val"],
+                    "DM_MSE_Verdict": dm_mse["verdict"],
+                    "DM_MAE_Stat": dm_mae["dm_stat"],
+                    "DM_MAE_pVal": dm_mae["p_val"],
+                    "DM_MAE_Verdict": dm_mae["verdict"]
+                })
 
 
 # ------------------------------------------------------------
-# 4. EXPORT & DISPLAY RESULTS
+# 4. DISPLAY AND SAVE SUMMARY RESULTS
 # ------------------------------------------------------------
-eval_results_df = pd.DataFrame(evaluation_metrics)
-jtest_results_df = pd.DataFrame(jtest_summary)
+eval_metrics_df = pd.DataFrame(evaluation_metrics)
+test_summary_df = pd.DataFrame(jtest_summary)
 
-if not eval_results_df.empty:
-    eval_csv_path = os.path.join(OUTPUT_DIR_BASE, "ICDL_scenario_performance_metrics.csv")
-    eval_results_df.to_csv(eval_csv_path, index=False)
-    print(f"\n✓ Scenario evaluation metrics saved to: {eval_csv_path}")
-    display(eval_results_df.head(15))
+print("\n" + "=" * 90)
+print("DEPLOYMENT ACCURACY METRICS")
+print("=" * 90)
+display(eval_metrics_df)
 
-if not jtest_results_df.empty:
-    jtest_csv_path = os.path.join(OUTPUT_DIR_BASE, "Davidson_MacKinnon_JTest_results.csv")
-    jtest_results_df.to_csv(jtest_csv_path, index=False)
-    print(f"\n✓ Davidson-MacKinnon J-Test results saved to: {jtest_csv_path}")
-    print("\n" + "=" * 75)
-    print("DAVIDSON-MACKINNON J-TEST SUMMARY")
-    print("=" * 75)
-    display(jtest_results_df)
+print("\n" + "=" * 90)
+print("STATISTICAL SIGNIFICANCE SUMMARY (J-TEST & DIEBOLD-MARIANO)")
+print("=" * 90)
+display(test_summary_df)
+
+# Save test outputs to CSV
+metrics_out_path = os.path.join(OUTPUT_DIR_CELL18, "cell18_icdl_deployment_metrics.csv")
+tests_out_path = os.path.join(OUTPUT_DIR_CELL18, "cell18_jtest_diebold_mariano_results.csv")
+
+eval_metrics_df.to_csv(metrics_out_path, index=False)
+test_summary_df.to_csv(tests_out_path, index=False)
+
+print(f"\n✓ Saved deployment accuracy metrics to: {metrics_out_path}")
+print(f"✓ Saved J-Test & Diebold-Mariano results to: {tests_out_path}")
