@@ -16,17 +16,16 @@
 //   255 = NoData, if present
 //
 // Only pixels == 1 are used.
+====================
+// The Python deployment experiment uses:
 //
-// IMPORTANT:
-// Each monthly ICDL is used to produce a full set of MODIS DOYs.
-// The Python deployment experiment then uses:
+//   DOY 193,209 -> June ICDL, after June 30
+//   DOY 225,241 -> July ICDL, after July 31
+//   DOY 257,273 -> August ICDL, after August 31
 //
-//   DOY 161,177       -> June ICDL
-//   DOY 193,209       -> July ICDL
-//   DOY 225+          -> August ICDL
-//
-// ============================================================================
-
+// Full-season exports are allowed; Python limits vegetation
+// features to the forecast cutoff before interpolation.
+// Export timestamps must also respect actual data availability.
 
 // ============================================================================
 // 1. CHANGE THESE FOR EACH YEAR
