@@ -1,0 +1,32 @@
+# ---- Data (not distributed; see README > Data) ----
+v5_data/
+BSE509 - Clean Data/
+*.csv            # MODIS / PRISM / SoilGrids / yield inputs are large & source-licensed
+
+# ---- Model run outputs & work dirs (regenerable) ----
+v5_50_seed/
+v5_seeds/
+v5_work/
+v5_run_once/
+v5_run_screens/
+v5_run_shots/
+v5_results_smoke/
+seed_out/
+stat_out/
+oat_runs/
+oat_work/
+figs/
+figs_demo/
+final_figs/
+*.log
+
+# ---- Figures (regenerable). Remove this line if you want key figures in the repo,
+#      or force-add specific ones with:  git add -f final_figs/01_scenario_ranking_rmse.png
+*.png
+
+# ---- Python ----
+__pycache__/
+*.pyc
+.venv/
+env/
+.ipynb_checkpoints/
