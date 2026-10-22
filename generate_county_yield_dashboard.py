@@ -15,7 +15,7 @@ NASS_FILE = ROOT / "NASS_corn_2008_2026-02-05.csv"
 OUTPUT_FILE = DATA_DIR / "summary" / "county_yield_dashboard.html"
 
 SCENARIOS = {
-    ("PREVIOUS_CDL", "PREVIOUS_CDL"): "Previous CDL training / previous CDL testing",
+    #("PREVIOUS_CDL", "PREVIOUS_CDL"): "Previous CDL training / previous CDL testing",
     ("SAME_YEAR_CDL", "PREVIOUS_CDL"): "Same-year CDL training / previous CDL testing",
     ("SAME_YEAR_CDL", "FINAL_CDL"): "Same-year CDL training / final CDL testing (hindsight)",
     ("SAME_YEAR_CDL", "STUDY"): "Same-year CDL training / study testing",
