@@ -23,6 +23,8 @@ PREDICTIONS = DATA_ROOT / "summary" / "ensemble_county_predictions.csv"
 SEED_PREDICTIONS = DATA_ROOT / "seeds" / "seed_1" / "county_predictions.csv"
 SEED_METRICS = DATA_ROOT / "summary" / "all_seed_metrics.csv"
 OUTPUT_DIR = ROOT / "sanity_check_graphics"
+TRAINING_MASK = "SAME_YEAR_CDL"
+TESTING_MASK = "STUDY"
 PRIMARY_LIMIT_PERCENT = 10.0
 R2_LIMIT = 0.60
 HAND_CHECK_YEAR = 2025
@@ -85,7 +87,7 @@ def load_ensemble():
 
     result = []
     for source in rows:
-        if (source["training_mask"], source["testing_mask"]) != ("PREVIOUS_CDL", "PREVIOUS_CDL"):
+        if (source["training_mask"], source["testing_mask"]) != (TRAINING_MASK, TESTING_MASK):
             continue
         item = {
             "year": int(source["year"]),
@@ -104,7 +106,7 @@ def load_ensemble():
             raise ValueError(f"Expected 50 seeds, found {item['n_seeds']} at {item['year']}/{item['doy']}.")
         result.append(item)
     if not result:
-        raise ValueError("No PREVIOUS_CDL/ PREVIOUS_CDL ensemble predictions found.")
+        raise ValueError(f"No {TRAINING_MASK}/{TESTING_MASK} ensemble predictions found.")
     return result
 
 
@@ -159,7 +161,7 @@ def independently_verify_metrics():
     sample = [
         row for row in source_rows
         if (row["training_mask"], row["testing_mask"], row["year"], row["doy"])
-        == ("PREVIOUS_CDL", "PREVIOUS_CDL", str(HAND_CHECK_YEAR), str(HAND_CHECK_DOY))
+        == (TRAINING_MASK, TESTING_MASK, str(HAND_CHECK_YEAR), str(HAND_CHECK_DOY))
     ]
     if not sample:
         raise ValueError(f"No seed-{HAND_CHECK_SEED} records for {HAND_CHECK_YEAR}/DOY {HAND_CHECK_DOY}.")
@@ -176,7 +178,7 @@ def independently_verify_metrics():
     stored = [
         row for row in read_csv(SEED_METRICS)
         if (row["training_mask"], row["testing_mask"], row["year"], row["doy"], row["seed"])
-        == ("PREVIOUS_CDL", "PREVIOUS_CDL", str(HAND_CHECK_YEAR), str(HAND_CHECK_DOY), str(HAND_CHECK_SEED))
+        == (TRAINING_MASK, TESTING_MASK, str(HAND_CHECK_YEAR), str(HAND_CHECK_DOY), str(HAND_CHECK_SEED))
     ]
     if len(stored) != 1:
         raise ValueError(f"Expected one stored audit-metric row; found {len(stored)}.")
@@ -218,12 +220,13 @@ def independently_verify_metrics():
 def write_metric_csv(detail, pooled_by_day, pooled, year_metrics, hand_check):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     with (OUTPUT_DIR / "sanity_check_metrics.csv").open("w", newline="", encoding="utf-8") as destination:
-        fields = ["year", "doy", "n", "rmse_model_bu_acre", "rmse_trend_bu_acre", "mape_model_percent",
+        fields = ["training_mask", "testing_mask", "year", "doy", "n", "rmse_model_bu_acre", "rmse_trend_bu_acre", "mape_model_percent",
                   "mape_trend_percent", "r2", "mae_model_bu_acre", "bias_bu_acre"]
         writer = csv.DictWriter(destination, fieldnames=fields)
         writer.writeheader()
         for row in detail:
             writer.writerow({
+                "training_mask": TRAINING_MASK, "testing_mask": TESTING_MASK,
                 "year": row["year"], "doy": row["doy"], "n": row["n"],
                 "rmse_model_bu_acre": row["rmse_model"], "rmse_trend_bu_acre": row["rmse_trend"],
                 "mape_model_percent": row["mape"], "mape_trend_percent": row["trend_mape"],
@@ -231,7 +234,8 @@ def write_metric_csv(detail, pooled_by_day, pooled, year_metrics, hand_check):
             })
         for doy, row in pooled_by_day.items():
             writer.writerow({
-                "year": "Pooled 2021-2025", "doy": doy, "n": row["n"],
+                "training_mask": TRAINING_MASK, "testing_mask": TESTING_MASK,
+                "year": f"Pooled {min(year_metrics)}-{max(year_metrics)}", "doy": doy, "n": row["n"],
                 "rmse_model_bu_acre": row["rmse_model"], "rmse_trend_bu_acre": row["rmse_trend"],
                 "mape_model_percent": row["mape"], "mape_trend_percent": row["trend_mape"],
                 "r2": row["r2"], "mae_model_bu_acre": row["mae"], "bias_bu_acre": row["bias"],
@@ -239,16 +243,22 @@ def write_metric_csv(detail, pooled_by_day, pooled, year_metrics, hand_check):
 
     with (OUTPUT_DIR / "independent_metric_check.csv").open("w", newline="", encoding="utf-8") as destination:
         writer = csv.writer(destination)
-        writer.writerow(["metric", "independently_recomputed", "stored_seed_metric", "absolute_percent_difference",
+        writer.writerow(["training_mask", "testing_mask", "metric", "independently_recomputed", "stored_seed_metric", "absolute_percent_difference",
                          "year", "doy", "seed", "county_count"])
         for name in ("rmse", "mae", "r2"):
-            writer.writerow([name, hand_check[name], hand_check["stored"][name],
+            writer.writerow([TRAINING_MASK, TESTING_MASK, name, hand_check[name], hand_check["stored"][name],
                              hand_check["discrepancies"][name], HAND_CHECK_YEAR, HAND_CHECK_DOY,
                              HAND_CHECK_SEED, hand_check["n"]])
     with (OUTPUT_DIR / "independent_metric_sample.csv").open("w", newline="", encoding="utf-8") as destination:
-        writer = csv.DictWriter(destination, fieldnames=list(hand_check["table"][0]))
+        writer = csv.DictWriter(
+            destination,
+            fieldnames=["training_mask", "testing_mask", *hand_check["table"][0].keys()],
+        )
         writer.writeheader()
-        writer.writerows(hand_check["table"])
+        writer.writerows([
+            {"training_mask": TRAINING_MASK, "testing_mask": TESTING_MASK, **row}
+            for row in hand_check["table"]
+        ])
 
 
 def doy_label(doy):
@@ -303,7 +313,7 @@ def make_spec_check_figure(detail, years, pooled):
                  ha="left", fontsize=14, fontweight="bold")
     fig.text(
         0.055, 0.006,
-        "Points use the 50-seed mean prediction versus the same observed-yield cohort for each year/DOY. "
+        "Protocol: same-year CDL training / published ICDL (STUDY) test mask. Points use the 50-seed mean prediction versus the same observed-yield cohort. "
         "Overall MAPE is pooled over county-date records; some early dates exceed 10%. R² is computed across counties at each year/DOY.",
         fontsize=7.5, color=COLORS["muted"],
     )
@@ -352,7 +362,8 @@ def make_benchmark_figure(pooled_by_day, pooled):
     )
     fig.text(
         0.055, 0.005,
-        f"Same county-year-date observations are scored both ways. Pooled RMSE: model {pooled['rmse_model']:.2f} vs trend "
+        f"Same-year CDL training / published ICDL (STUDY) test mask. Same county-year-date observations are scored both ways. "
+        f"Pooled RMSE: model {pooled['rmse_model']:.2f} vs trend "
         f"{pooled['rmse_trend']:.2f} bu/ac; pooled MSE skill {100*(1-(pooled['rmse_model']/pooled['rmse_trend'])**2):.1f}%. "
         f"DOY 273 skill {final_skill:.1f}%; pooled RMSE reduction {improvement:.2f} bu/ac. "
         "Trend is a simple internal reference baseline, not an external published benchmark.",
@@ -363,13 +374,14 @@ def make_benchmark_figure(pooled_by_day, pooled):
     return fig
 
 
-def make_hand_check_figure(check):
+def make_hand_check_figure(check, records):
     fig = plt.figure(figsize=(11.7, 7.4))
     fig.suptitle("Independent arithmetic check of the software’s county error metrics", x=0.055, y=0.985,
                  ha="left", fontsize=14, fontweight="bold")
     fig.text(
         0.055, 0.925,
-        f"Worked audit case: seed {HAND_CHECK_SEED}, {HAND_CHECK_YEAR}, DOY {HAND_CHECK_DOY}  |  "
+        f"Same-year CDL training / study test mask  |  seed {HAND_CHECK_SEED}, "
+        f"{HAND_CHECK_YEAR}, DOY {HAND_CHECK_DOY}  |  "
         f"held-out county count N = {check['n']:,}  |  first six FIPS shown below",
         fontsize=8.8, color=COLORS["muted"],
     )
@@ -447,7 +459,10 @@ def make_hand_check_figure(check):
     )
     fig.text(
         0.055, 0.045,
-        "Boundary check across the 22,478 county-date predictions: 0 negative predictions; observed yields 27.7–253.6 bu/ac; model predictions 2.05–248.44 bu/ac.",
+        f"Boundary check across {len(records):,} county-date predictions: "
+        f"{sum(row['predicted'] < 0 for row in records)} negative predictions; "
+        f"observed yields {min(row['actual'] for row in records):.1f}–{max(row['actual'] for row in records):.1f} bu/ac; "
+        f"model predictions {min(row['predicted'] for row in records):.2f}–{max(row['predicted'] for row in records):.2f} bu/ac.",
         fontsize=8.1, color=COLORS["muted"],
     )
     save_png(fig, "03_independent_metric_arithmetic_check.png")
@@ -487,7 +502,7 @@ def make_validation_plan_figure():
                  ha="left", fontsize=14, fontweight="bold")
     fig.text(
         0.045, 0.935,
-        "Primary design specification: county-date mean absolute percentage error (MAPE) ≤ 10% against final USDA NASS county yield.",
+        "Same-year CDL training / published ICDL test mask. Primary specification: county-date MAPE ≤ 10% against final USDA NASS county yield.",
         fontsize=9.2, color=COLORS["ink"], fontweight="bold",
     )
     positions = [
@@ -519,7 +534,7 @@ def main():
     figures = [
         make_spec_check_figure(detail, year_metrics, pooled),
         make_benchmark_figure(pooled_by_day, pooled),
-        make_hand_check_figure(hand_check),
+        make_hand_check_figure(hand_check, rows),
         make_validation_plan_figure(),
     ]
 
@@ -530,12 +545,12 @@ def main():
         "04_validation_plan_blueprint.png",
     ]
     pdf_path = OUTPUT_DIR / "sanity_check_graphics.pdf"
-    with PdfPages(pdf_path, metadata={"Title": "Corn yield model sanity checks and validation plan"}) as pdf:
+    with PdfPages(pdf_path, metadata={"Title": "Same-year CDL and published ICDL sanity checks"}) as pdf:
         for fig in figures:
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
 
-    print(f"Processed {len(rows):,} county-date records across {len(year_metrics)} test years.")
+    print(f"Processed {len(rows):,} {TRAINING_MASK}/{TESTING_MASK} county-date records across {len(year_metrics)} test years.")
     print(f"Pooled MAPE: {pooled['mape']:.2f}% (target <= {PRIMARY_LIMIT_PERCENT:.1f}%).")
     print(f"Pooled R2: {pooled['r2']:.3f}; all year/date R2 values exceed {R2_LIMIT:.2f}.")
     print(f"Pooled model/trend RMSE: {pooled['rmse_model']:.2f}/{pooled['rmse_trend']:.2f} bu/ac.")

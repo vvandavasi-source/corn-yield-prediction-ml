@@ -13,9 +13,9 @@ DATA_DIR = ROOT / "v5_50_seed_all_in_one" / "v5_50_seed_all_in_one"
 SEEDS_DIR = DATA_DIR / "seeds"
 NASS_FILE = ROOT / "NASS_corn_2008_2026-02-05.csv"
 OUTPUT_FILE = DATA_DIR / "summary" / "county_yield_dashboard.html"
+COUNTY_GEOJSON_URL = "https://raw.githubusercontent.com/plotly/datasets/master/geojson-counties-fips.json"
 
 SCENARIOS = {
-    #("PREVIOUS_CDL", "PREVIOUS_CDL"): "Previous CDL training / previous CDL testing",
     ("SAME_YEAR_CDL", "PREVIOUS_CDL"): "Same-year CDL training / previous CDL testing",
     ("SAME_YEAR_CDL", "FINAL_CDL"): "Same-year CDL training / final CDL testing (hindsight)",
     ("SAME_YEAR_CDL", "STUDY"): "Same-year CDL training / study testing",
@@ -117,7 +117,10 @@ def read_seed_predictions():
 
 def write_dashboard(records):
     payload = json.dumps(records, separators=(",", ":"), ensure_ascii=False).replace("<", "\\u003c")
-    scenarios = sorted({row["s"] for row in records})
+    scenarios = sorted(
+        {row["s"] for row in records},
+        key=lambda scenario: (0 if "study testing" in scenario.lower() else 1, scenario),
+    )
     years = sorted({row["y"] for row in records})
     states = sorted({(row["sc"], row["st"]) for row in records}, key=lambda item: item[1])
     if not records:
@@ -127,7 +130,14 @@ def write_dashboard(records):
         f'<option value="{html.escape(scenario, quote=True)}">{html.escape(scenario)}</option>'
         for scenario in scenarios
     )
-    year_options = "\n".join(f'<option value="{year}">{year}</option>' for year in years)
+    year_options = "\n".join(
+        f'<option value="{year}"{" selected" if year == max(years) else ""}>{year}</option>'
+        for year in years
+    )
+    map_day_options = "\n".join(
+        f'<option value="{doy}">{doy}</option>'
+        for doy in sorted({row["d"] for row in records})
+    )
     state_options = "\n".join(
         f'<option value="{code}">{html.escape(name)}</option>' for code, name in states
     )
@@ -160,6 +170,12 @@ def write_dashboard(records):
     .panel p { margin:2px 10px 0; color:var(--muted); font-size:12px; }
     .chart { height:390px; }
     .wide { grid-column:1 / -1; }
+    .map-controls { display:flex; align-items:center; gap:10px; margin:8px 10px 0; }
+    .map-controls label { min-width:150px; }
+    .map-controls select { max-width:180px; }
+    .map-summary { margin:8px 10px 0; color:var(--ink); font-size:13px; font-weight:600; }
+    .map-status { min-height:18px; margin:2px 10px 0; color:#8a3d32; font-size:12px; }
+    #countyMap { height:610px; }
     .note { margin:14px 2px 0; color:var(--muted); font-size:12px; }
     .warning { display:none; margin:12px 0; padding:12px; border:1px solid #f1c27d; border-radius:6px; background:#fff8e9; color:#664b1c; }
     @media (max-width:850px) { .controls { grid-template-columns:1fr 1fr; } .grid { grid-template-columns:1fr; } .wide { grid-column:auto; } .kpis { grid-template-columns:1fr 1fr; } }
@@ -169,7 +185,7 @@ def write_dashboard(records):
 <body>
   <header>
     <h1>County Corn Yield Explorer</h1>
-    <p>Explore county predictions across the available states, growing-season observation dates, years, and training/testing scenarios. Yield and error are in bushels per acre.</p>
+    <p>Explore county predictions from the same-year CDL training protocol across the available states, growing-season observation dates, years, and test-mask scenarios. Yield and error are in bushels per acre.</p>
   </header>
   <main>
     <section class="controls" aria-label="Dashboard filters">
@@ -186,6 +202,16 @@ def write_dashboard(records):
       <div class="kpi"><span>Counties in state · selected year</span><strong id="countKpi">—</strong></div>
     </section>
     <section class="grid">
+      <article class="panel wide">
+        <h2>Predicted yield by county</h2>
+        <p>National overview for the selected training/testing scenario and year. Hover a county for predicted and observed yield, error, historical trend, and seed spread. The map is independent of the state filter used by the charts below.</p>
+        <div class="map-controls">
+          <label>Map observation date<select id="mapDoy">__MAP_DAYS__</select></label>
+        </div>
+        <p id="mapSummary" class="map-summary"></p>
+        <div id="mapStatus" class="map-status" role="status" aria-live="polite"></div>
+        <div id="countyMap" class="chart"></div>
+      </article>
       <article class="panel">
         <h2>County yield through the season</h2>
         <p>Observed yield, 50-seed mean prediction, historical trend, and ±1 seed standard deviation.</p>
@@ -215,8 +241,10 @@ def write_dashboard(records):
     const stateSelect = document.getElementById("state");
     const countySelect = document.getElementById("county");
     const yearSelect = document.getElementById("year");
+    const mapDoySelect = document.getElementById("mapDoy");
     const stateNames = Object.fromEntries([...document.querySelectorAll("#state option")].map(o => [o.value, o.textContent]));
     const palette = { observed:"#176b87", predicted:"#d49a35", trend:"#8293a1", error:"#a24436", abs:"#d49a35", mae:"#176b87", rmse:"#36836b" };
+    let renderedMapKey = "";
     const commonLayout = {
       autosize:true, paper_bgcolor:"#fff", plot_bgcolor:"#fff", font:{family:"Segoe UI, Arial, sans-serif",color:"#304657",size:12},
       margin:{l:58,r:22,t:20,b:56}, hovermode:"x unified",
@@ -229,6 +257,31 @@ def write_dashboard(records):
     const byDoy = (a,b) => a.d-b.d;
     function filteredRows() {
       return rows.filter(r => r.s === scenarioSelect.value && r.sc === stateSelect.value && r.y === Number(yearSelect.value));
+    }
+    function updateYears() {
+      const available = [...new Set(rows.filter(r => r.s === scenarioSelect.value).map(r => r.y))].sort((a,b) => a-b);
+      const previous = Number(yearSelect.value);
+      yearSelect.replaceChildren(...available.map(year => {
+        const option = document.createElement("option");
+        option.value = year;
+        option.textContent = year;
+        return option;
+      }));
+      yearSelect.value = available.includes(previous) ? String(previous) : String(available[available.length - 1] || "");
+    }
+    function updateStates() {
+      const available = new Map(
+        rows.filter(r => r.s === scenarioSelect.value && r.y === Number(yearSelect.value))
+          .map(r => [r.sc, r.st])
+      );
+      const previous = stateSelect.value;
+      stateSelect.replaceChildren(...[...available].sort((a,b) => a[1].localeCompare(b[1])).map(([code,name]) => {
+        const option = document.createElement("option");
+        option.value = code;
+        option.textContent = name;
+        return option;
+      }));
+      stateSelect.value = available.has(previous) ? previous : stateSelect.options[0]?.value || "";
     }
     function updateCounties() {
       const stateRows = rows.filter(r => r.s === scenarioSelect.value && r.sc === stateSelect.value && r.y === Number(yearSelect.value));
@@ -244,6 +297,81 @@ def write_dashboard(records):
       });
       if (counties.has(previous)) countySelect.value = previous;
     }
+    function updateMapDates() {
+      const available = [...new Set(
+        rows.filter(r => r.s === scenarioSelect.value && r.y === Number(yearSelect.value)).map(r => r.d)
+      )].sort((a,b) => a-b);
+      const previous = Number(mapDoySelect.value);
+      mapDoySelect.replaceChildren(...available.map(doy => {
+        const option = document.createElement("option");
+        option.value = doy;
+        option.textContent = doy;
+        return option;
+      }));
+      mapDoySelect.value = available.includes(previous) ? String(previous) : String(available[available.length - 1] || "");
+      return available;
+    }
+    function renderCountyMap() {
+      const year = Number(yearSelect.value);
+      const doy = Number(mapDoySelect.value);
+      const mapRows = rows.filter(r =>
+        r.s === scenarioSelect.value && r.y === year && r.d === doy
+      );
+      const status = document.getElementById("mapStatus");
+      document.getElementById("mapSummary").textContent =
+        `${scenarioSelect.value} · ${year} · DOY ${doy} · ${mapRows.length.toLocaleString()} counties across ${new Set(mapRows.map(r => r.sc)).size} states. Color scale is fixed across dates for this scenario and year.`;
+      if (!mapRows.length) {
+        renderedMapKey = "";
+        status.textContent = "No county predictions are available for this map selection.";
+        Plotly.purge("countyMap");
+        return;
+      }
+      const mapKey = `${scenarioSelect.value}|${year}|${doy}`;
+      if (mapKey === renderedMapKey) return;
+      status.textContent = "";
+      const rangeRows = rows.filter(r => r.s === scenarioSelect.value && r.y === year);
+      const values = rangeRows.map(r => r.p);
+      const customdata = mapRows.map(r => [r.c, r.st, r.f, r.a, r.p-r.a, Math.abs(r.p-r.a), r.t, r.sd, r.n]);
+      Plotly.react("countyMap", [{
+        type:"choropleth",
+        geojson:__COUNTY_GEOJSON_URL__,
+        featureidkey:"id",
+        locations:mapRows.map(r => r.f),
+        z:mapRows.map(r => r.p),
+        zmin:Math.min(...values),
+        zmax:Math.max(...values),
+        colorscale:"YlGnBu",
+        marker:{line:{color:"#ffffff",width:0.25}},
+        colorbar:{title:{text:"Yield<br>(bu/ac)"},thickness:18},
+        customdata,
+        hovertemplate:
+          "<b>%{customdata[0]}, %{customdata[1]}</b><br>" +
+          "FIPS: %{customdata[2]}<br>" +
+          `Year ${year} · DOY ${doy}<br>` +
+          "Predicted (50-seed mean): %{z:.1f} bu/ac<br>" +
+          "Observed yield: %{customdata[3]:.1f} bu/ac<br>" +
+          "Signed error: %{customdata[4]:.1f} bu/ac<br>" +
+          "Absolute error: %{customdata[5]:.1f} bu/ac<br>" +
+          "Historical trend: %{customdata[6]:.1f} bu/ac<br>" +
+          "Seed SD (not a confidence interval): %{customdata[7]:.2f} bu/ac<br>" +
+          "Seeds: %{customdata[8]}<extra></extra>"
+      }],{
+        autosize:true,paper_bgcolor:"#fff",plot_bgcolor:"#fff",
+        font:{family:"Segoe UI, Arial, sans-serif",color:"#304657",size:12},
+        margin:{l:0,r:0,t:8,b:0},
+        geo:{
+          scope:"usa",projection:{type:"albers usa"},fitbounds:"locations",
+          showland:true,landcolor:"#f5f7f8",showlakes:true,lakecolor:"#fff",
+          showcountries:false,showsubunits:true,subunitcolor:"#b9c7ce"
+        }
+      },plotConfig).then(() => {
+        renderedMapKey = mapKey;
+      }).catch(error => {
+        renderedMapKey = "";
+        console.error("County yield map failed to render.",error);
+        status.textContent = "Map could not be loaded. Check your internet connection and reload; county boundary data is loaded from Plotly's public GeoJSON.";
+      });
+    }
     function dateLabels(doys) {
       const year = Number(yearSelect.value);
       return doys.map(doy => {
@@ -257,7 +385,11 @@ def write_dashboard(records):
       warning.style.display = message ? "block" : "none";
     }
     function render() {
+      updateYears();
+      updateStates();
       updateCounties();
+      updateMapDates();
+      renderCountyMap();
       const selected = filteredRows();
       const countyRows = selected.filter(r => r.f === countySelect.value).sort(byDoy);
       const dates = [...new Set(selected.map(r => r.d))].sort((a,b) => a-b);
@@ -322,7 +454,7 @@ def write_dashboard(records):
         yaxis:{...commonLayout.yaxis,title:"Error (bu/acre)",rangemode:"tozero"}
       },plotConfig);
     }
-    for (const control of [scenarioSelect,stateSelect,countySelect,yearSelect]) control.addEventListener("change",render);
+    for (const control of [scenarioSelect,stateSelect,countySelect,yearSelect,mapDoySelect]) control.addEventListener("change",render);
     render();
   </script>
 </body>
@@ -331,6 +463,8 @@ def write_dashboard(records):
     page = page.replace("__SCENARIOS__", scenario_options)
     page = page.replace("__STATES__", state_options)
     page = page.replace("__YEARS__", year_options)
+    page = page.replace("__MAP_DAYS__", map_day_options)
+    page = page.replace("__COUNTY_GEOJSON_URL__", json.dumps(COUNTY_GEOJSON_URL))
     page = page.replace("__DATA__", payload)
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT_FILE.write_text(page, encoding="utf-8")

@@ -24,29 +24,26 @@ FIGURE_SEASONAL = FIGURE_DIR / "extra_credit_seasonal_comparison.png"
 FIGURE_HEATMAP = FIGURE_DIR / "extra_credit_late_season_heatmap.png"
 
 SCENARIO_ORDER = [
-    "Previous CDL training / previous CDL testing",
     "Same-year CDL training / previous CDL testing",
     "Final CDL hindsight benchmark",
     "Our ICDLs",
     "Published ICDLs",
 ]
 SCENARIO_SHORT = {
-    SCENARIO_ORDER[0]: "Previous CDL train / previous CDL test",
-    SCENARIO_ORDER[1]: "Same-year train / previous CDL test",
-    SCENARIO_ORDER[2]: "Final CDL train/test (hindsight)",
-    SCENARIO_ORDER[3]: "Our ICDLs (clean rebuilt)",
-    SCENARIO_ORDER[4]: "Published ICDLs (study)",
+    SCENARIO_ORDER[0]: "Previous CDL test mask",
+    SCENARIO_ORDER[1]: "Final CDL test mask (hindsight)",
+    SCENARIO_ORDER[2]: "Our ICDLs (clean rebuilt)",
+    SCENARIO_ORDER[3]: "Published ICDLs (study)",
 }
 COLORS = {
     SCENARIO_ORDER[0]: "#176b87",
-    SCENARIO_ORDER[1]: "#d4842b",
-    SCENARIO_ORDER[2]: "#778391",
-    SCENARIO_ORDER[3]: "#39826c",
-    SCENARIO_ORDER[4]: "#8664a8",
+    SCENARIO_ORDER[1]: "#778391",
+    SCENARIO_ORDER[2]: "#39826c",
+    SCENARIO_ORDER[3]: "#8664a8",
 }
 TEST_COHORT_LABELS = {
-    "PREVIOUS_CDL": "Previous CDL",
-    "FINAL_CDL": "Final CDL (hindsight)",
+    "PREVIOUS_CDL": "Previous CDL test mask",
+    "FINAL_CDL": "Final CDL test mask (hindsight)",
     "STUDY": "Study",
     "CLEAN_REBUILT": "Clean rebuilt",
 }
@@ -69,6 +66,8 @@ def read_metrics():
 def summarize(rows):
     groups = defaultdict(list)
     for row in rows:
+        if row["training_mask"] != "SAME_YEAR_CDL":
+            continue
         key = (row["training_mask"], row["testing_mask"], row["scenario"])
         groups[key].append(row)
 
@@ -91,22 +90,22 @@ def summarize(rows):
 
 
 def write_summary_csv(summaries, rows):
-    baseline_key = ("PREVIOUS_CDL", "PREVIOUS_CDL")
-    same_year_key = ("SAME_YEAR_CDL", "PREVIOUS_CDL")
-    baseline = {
+    our_key = ("SAME_YEAR_CDL", "CLEAN_REBUILT")
+    published_key = ("SAME_YEAR_CDL", "STUDY")
+    our_model = {
         (int(row["year"]), int(row["doy"])): float(row["rmse_mean"])
         for row in rows
-        if (row["training_mask"], row["testing_mask"]) == baseline_key
+        if (row["training_mask"], row["testing_mask"]) == our_key
     }
-    alternative = {
+    published_model = {
         (int(row["year"]), int(row["doy"])): float(row["rmse_mean"])
         for row in rows
-        if (row["training_mask"], row["testing_mask"]) == same_year_key
+        if (row["training_mask"], row["testing_mask"]) == published_key
     }
-    common = sorted(set(baseline) & set(alternative))
+    common = sorted(set(our_model) & set(published_model))
     if not common:
-        raise ValueError("No matched evaluation periods found for the previous-CDL test comparison.")
-    paired_deltas = [alternative[key] - baseline[key] for key in common]
+        raise ValueError("No matched evaluation periods found for the ICDL test-mask comparison.")
+    paired_deltas = [our_model[key] - published_model[key] for key in common]
     delta_mean = statistics.mean(paired_deltas)
     delta_sd = statistics.stdev(paired_deltas) if len(paired_deltas) > 1 else 0.0
 
@@ -114,20 +113,20 @@ def write_summary_csv(summaries, rows):
     with OUTPUT_CSV.open("w", newline="", encoding="utf-8") as destination:
         writer = csv.writer(destination)
         writer.writerow([
-            "scenario", "training_mask", "testing_mask", "evaluation_periods_year_doy",
+            "training_protocol", "testing_mask", "scenario", "evaluation_periods_year_doy",
             "years", "rmse_mean_bu_acre", "rmse_sd_across_periods_bu_acre",
             "mae_mean_bu_acre", "mae_sd_across_periods_bu_acre", "r2_mean",
             "r2_sd_across_periods", "anomaly_r2_mean", "anomaly_r2_sd_across_periods",
-            "paired_rmse_delta_vs_previous_cdl_baseline_bu_acre", "paired_periods",
+            "paired_rmse_delta_our_minus_published_bu_acre", "paired_periods",
         ])
         for item in summaries:
             metrics = item["metrics"]
-            is_matched_alternative = (item["training"], item["testing"]) == same_year_key
-            is_baseline = (item["training"], item["testing"]) == baseline_key
-            delta = 0.0 if is_baseline else delta_mean if is_matched_alternative else ""
-            paired_count = len(common) if is_matched_alternative or is_baseline else ""
+            is_matched_alternative = (item["training"], item["testing"]) == our_key
+            is_published = (item["training"], item["testing"]) == published_key
+            delta = delta_mean if is_matched_alternative or is_published else ""
+            paired_count = len(common) if is_matched_alternative or is_published else ""
             writer.writerow([
-                item["scenario"], item["training"], item["testing"], item["periods"],
+                item["training"], item["testing"], item["scenario"], item["periods"],
                 item["years"], *[value for metric in ("rmse_mean", "mae_mean", "r2_mean", "anomaly_r2_mean")
                                  for value in metrics[metric]], delta, paired_count,
             ])
@@ -281,8 +280,8 @@ def xml_cell(text, width, header=False):
 
 def xml_table(summaries, delta_mean, delta_sd, n_paired):
     headers = [
-        "Model / evaluation scenario",
-        "Test cohort",
+        "Testing-mask scenario",
+        "Testing mask",
         "RMSE (bu ac\u207b\u00b9)",
         "MAE (bu ac\u207b\u00b9)",
         "R\u00b2 (unitless)",
@@ -325,9 +324,10 @@ def xml_table(summaries, delta_mean, delta_sd, n_paired):
     )
     note = (
         "Values are mean \u00b1 sample SD across available year \u00d7 DOY groups; each underlying group reports 50 seeds. "
-        "The two previous-CDL test rows share 30 matched evaluation periods. Their matched RMSE difference "
-        f"(same-year training minus previous-CDL training) is {delta_mean:+.2f} \u00b1 {delta_sd:.2f} bu ac\u207b\u00b9 "
-        f"across {n_paired} paired groups. Other rows have different test cohorts and/or incomplete year coverage."
+        "Every model uses SAME_YEAR_CDL training; previous CDL appears only as one evaluation mask. "
+        "Our ICDL minus published ICDL RMSE is "
+        f"{delta_mean:+.2f} \u00b1 {delta_sd:.2f} bu ac\u207b\u00b9 across {n_paired} matched year \u00d7 DOY groups. "
+        "This is descriptive: mask cohorts differ, and the SD is not a confidence interval."
     )
     return table + xml_paragraph(note, italic=True, size=15, color="526575", after=130)
 
@@ -357,30 +357,39 @@ def image_paragraph(image_name, rel_id, number, width_inches=6.9, max_height=3.4
     )
 
 
-def make_docx(summaries, delta_mean, delta_sd, n_paired):
+def make_docx(summaries, source_rows, delta_mean, delta_sd, n_paired):
+    published_rows = [row for row in source_rows if row["testing_mask"] == "STUDY"]
+    seasonal_rmse = {
+        doy: statistics.mean(float(row["rmse_mean"]) for row in published_rows if int(row["doy"]) == doy)
+        for doy in sorted({int(row["doy"]) for row in published_rows})
+    }
+    if not seasonal_rmse:
+        raise ValueError("No published ICDL test-mask metrics available for the appendix narrative.")
+    first_doy, last_doy = min(seasonal_rmse), max(seasonal_rmse)
     paragraphs = [
         xml_paragraph("CORN YIELD MODELING", bold=True, size=16, color="176B87", after=50),
         xml_paragraph("Scenario comparison and seasonal accuracy", style="Title", size=38, color="173B4A", after=70, keep=True),
         xml_paragraph(
-            "Technical appendix | 50-seed ensemble | County evaluations, 2021\u20132025 | Yield and error in bushels per acre",
+            "Technical appendix | 50-seed ensemble | Same-year CDL training | Yield and error in bushels per acre",
             size=16, color="526575", after=180,
         ),
         xml_paragraph("Engineered summary", style="Heading1", size=24, color="173B4A", after=70, keep=True),
         xml_paragraph(
-            "The table compares the available model scenarios using their reported 50-seed mean metrics. "
+            "All model runs use the same-year CDL training protocol. The table compares available test-mask scenarios using their reported 50-seed mean metrics. "
             "RMSE, MAE, and R\u00b2 are averaged over each scenario\u2019s available year-by-observation-date groups; "
             "the stated SD describes variation across those groups, not uncertainty in a single county prediction.",
             size=18, after=100,
         ),
         xml_paragraph(
-            "Table 1. Summary of county-yield model performance by training/testing scenario. Errors are in bu ac\u207b\u00b9; R\u00b2 is dimensionless.",
+            "Table 1. Summary of county-yield model performance by test mask under one fixed training protocol. Errors are in bu ac\u207b\u00b9; R\u00b2 is dimensionless.",
             bold=True, size=16, color="173B4A", after=50, keep=True,
         ),
         xml_table(summaries, delta_mean, delta_sd, n_paired),
         xml_paragraph("Technical interpretation", style="Heading1", size=24, color="173B4A", before=120, after=70, keep=True),
         xml_paragraph(
-            "Across the available scenarios, average RMSE declines from 18.52 bu ac\u207b\u00b9 at DOY 193 "
-            "to 14.84 bu ac\u207b\u00b9 at DOY 273, while anomaly R\u00b2 generally rises as the season progresses. "
+            f"For the published ICDL test mask, mean RMSE across available years changes from {seasonal_rmse[first_doy]:.2f} "
+            f"bu ac\u207b\u00b9 at DOY {first_doy} to {seasonal_rmse[last_doy]:.2f} bu ac\u207b\u00b9 at DOY {last_doy}; "
+            "later-season anomaly R\u00b2 and error are also summarized in the figures. "
             "This pattern is consistent with later-season model inputs containing additional crop-development "
             "information: canopy and vegetation signals have had more time to reflect biomass accumulation and "
             "yield formation. The scores alone do not establish that mechanism causally, and the observed "
@@ -388,20 +397,17 @@ def make_docx(summaries, delta_mean, delta_sd, n_paired):
             size=18, after=90,
         ),
         xml_paragraph(
-            "The fairest operational comparison is between the two rows tested on the same previous-CDL cohort. "
-            "Across 30 matched year-by-date groups, replacing previous-CDL training with same-year-CDL training "
-            "increases mean RMSE by "
-            f"{delta_mean:.2f} bu ac\u207b\u00b9 (paired-group SD {delta_sd:.2f}); however, the difference varies "
-            "across evaluation periods, so the aggregate alone does not warrant a significance claim. The final-CDL "
-            "benchmark has lower average error but uses hindsight inputs; it is not an operational forecast. "
-            "The ICDL rows cover fewer years and different test cohorts, so their averages are descriptive rather "
-            "than controlled head-to-head rankings.",
+            "The test-mask comparison does not change the training protocol: all rows use same-year CDL training. "
+            "Across the matched year-by-date groups, Our ICDL minus Published ICDL mean RMSE is "
+            f"{delta_mean:+.2f} bu ac\u207b\u00b9 (paired-group SD {delta_sd:.2f}, n={n_paired}); "
+            "the comparison is descriptive because the masks can yield different county cohorts. The final-CDL "
+            "test mask uses hindsight information and is not an operational forecast. "
+            "Previous CDL is retained only as an evaluation-mask reference, not as the training protocol.",
             size=18, after=90,
         ),
         xml_paragraph(
-            "For deployment, retain the previous-CDL model as the reference candidate for like-for-like previous-CDL "
-            "testing, and report the same-year and ICDL variants as separate sensitivity cases until their test "
-            "cohorts are aligned. The seasonal curves can guide update timing: later-season estimates are more "
+            "For deployment, choose between the published and clean-rebuilt ICDL test masks using matched county "
+            "coverage and availability checks; do not interpret differing cohorts as a controlled ranking. The seasonal curves can guide update timing: later-season estimates are more "
             "accurate on average in these outputs, while early-season estimates remain useful when lead time matters. "
             "Use the year-by-scenario heatmap to monitor whether that pattern is stable across years rather than "
             "selecting a model from the pooled mean alone.",
@@ -490,16 +496,17 @@ def make_docx(summaries, delta_mean, delta_sd, n_paired):
 def main():
     rows = read_metrics()
     summaries = summarize(rows)
-    delta_mean, delta_sd, n_paired = write_summary_csv(summaries, rows)
-    make_seasonal_figure(rows)
-    make_heatmap(rows)
-    make_docx(summaries, delta_mean, delta_sd, n_paired)
+    same_year_rows = [row for row in rows if row["training_mask"] == "SAME_YEAR_CDL"]
+    delta_mean, delta_sd, n_paired = write_summary_csv(summaries, same_year_rows)
+    make_seasonal_figure(same_year_rows)
+    make_heatmap(same_year_rows)
+    make_docx(summaries, same_year_rows, delta_mean, delta_sd, n_paired)
     print(f"Created {OUTPUT_DOCX}")
     print(f"Created {FIGURE_SEASONAL} and {FIGURE_HEATMAP}")
     print(f"Created {OUTPUT_CSV}")
     print(
-        f"Matched previous-CDL test comparison: {n_paired} year-by-date groups; "
-        f"mean RMSE change {delta_mean:+.2f} ± {delta_sd:.2f} bu/acre."
+        f"Matched clean-rebuilt vs study test-mask comparison: {n_paired} year-by-date groups; "
+        f"mean RMSE difference {delta_mean:+.2f} ± {delta_sd:.2f} bu/acre."
     )
 
 
