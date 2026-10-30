@@ -1,4 +1,4 @@
-"""Build the interactive dashboard from v5_50_seed_all_in_one; run with python generate_county_yield_dashboard.py."""
+"""Build the interactive dashboard from v5_out; run with python generate_county_yield_dashboard.py."""
 
 import csv
 import html
@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "v5_50_seed_all_in_one" / "v5_50_seed_all_in_one"
+DATA_DIR = ROOT / "v5_out"
 SEEDS_DIR = DATA_DIR / "seeds"
 NASS_FILE = ROOT / "NASS_corn_2008_2026-02-05.csv"
 OUTPUT_FILE = DATA_DIR / "summary" / "county_yield_dashboard.html"
@@ -150,7 +150,7 @@ def write_dashboard(records):
   <title>County Corn Yield Explorer</title>
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <style>
-    :root { color-scheme: light; --ink:#172b3a; --muted:#617486; --line:#dbe4eb; --blue:#176b87; --gold:#d49a35; --green:#36836b; }
+    :root { color-scheme: light; --ink:#172b3a; --muted:#617486; --line:#dbe4eb; --blue:#176b87; --gold:#d28a28; --green:#39826c; }
     * { box-sizing:border-box; }
     body { margin:0; background:#f3f6f8; color:var(--ink); font:15px/1.45 "Segoe UI",Arial,sans-serif; }
     header { padding:28px max(24px,calc((100vw - 1440px)/2)); background:#102d3a; color:white; }
@@ -243,7 +243,7 @@ def write_dashboard(records):
     const yearSelect = document.getElementById("year");
     const mapDoySelect = document.getElementById("mapDoy");
     const stateNames = Object.fromEntries([...document.querySelectorAll("#state option")].map(o => [o.value, o.textContent]));
-    const palette = { observed:"#176b87", predicted:"#d49a35", trend:"#8293a1", error:"#a24436", abs:"#d49a35", mae:"#176b87", rmse:"#36836b" };
+    const palette = { observed:"#176b87", predicted:"#39826c", trend:"#778391", error:"#b9503d", abs:"#d28a28", mae:"#176b87", rmse:"#39826c" };
     let renderedMapKey = "";
     const commonLayout = {
       autosize:true, paper_bgcolor:"#fff", plot_bgcolor:"#fff", font:{family:"Segoe UI, Arial, sans-serif",color:"#304657",size:12},
@@ -340,7 +340,7 @@ def write_dashboard(records):
         z:mapRows.map(r => r.p),
         zmin:Math.min(...values),
         zmax:Math.max(...values),
-        colorscale:"YlGnBu",
+        colorscale:[[0,"#FFFFFF"],[0.2,"#E9F3EF"],[0.5,"#AFCFC0"],[0.8,"#67A287"],[1,"#28634E"]],
         marker:{line:{color:"#ffffff",width:0.25}},
         colorbar:{title:{text:"Yield<br>(bu/ac)"},thickness:18},
         customdata,
@@ -409,7 +409,7 @@ def write_dashboard(records):
       const upper = countyRows.map(r => r.p+r.sd);
       const yieldTraces = [
         {x:countyRows.map(r=>r.d),y:upper,mode:"lines",line:{width:0},showlegend:false,hoverinfo:"skip"},
-        {x:countyRows.map(r=>r.d),y:lower,mode:"lines",line:{width:0},fill:"tonexty",fillcolor:"rgba(212,154,53,.17)",name:"±1 seed SD",hoverinfo:"skip"},
+        {x:countyRows.map(r=>r.d),y:lower,mode:"lines",line:{width:0},fill:"tonexty",fillcolor:"rgba(57,130,108,.17)",name:"±1 seed SD",hoverinfo:"skip"},
         {x:countyRows.map(r=>r.d),y:countyRows.map(r=>r.t),mode:"lines+markers",name:"Historical trend",line:{color:palette.trend,dash:"dot"},marker:{size:6}},
         {x:countyRows.map(r=>r.d),y:countyRows.map(r=>r.p),mode:"lines+markers",name:"50-seed mean prediction",line:{color:palette.predicted,width:2.5},marker:{size:7},customdata:countyRows.map(r=>[r.sd,r.n]),hovertemplate:"DOY %{x}<br>Predicted %{y:.1f} bu/ac<br>Seed SD %{customdata[0]:.2f}<br>Seeds n=%{customdata[1]}<extra></extra>"},
         {x:countyRows.map(r=>r.d),y:countyRows.map(r=>r.a),mode:"lines+markers",name:"Observed yield",line:{color:palette.observed,width:2.5},marker:{size:7}}

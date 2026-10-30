@@ -15,9 +15,10 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parent
-SUMMARY_DIR = ROOT / "v5_50_seed_all_in_one" / "v5_50_seed_all_in_one" / "summary"
+DATA_ROOT = ROOT / "v5_out"
+SUMMARY_DIR = DATA_ROOT / "summary"
 SOURCE = SUMMARY_DIR / "seed_summary_mean_sd.csv"
-FIGURE_DIR = SUMMARY_DIR / "figures"
+FIGURE_DIR = DATA_ROOT / "figs" / "extra_credit"
 OUTPUT_DOCX = SUMMARY_DIR / "extra_credit_technical_appendix.docx"
 OUTPUT_CSV = SUMMARY_DIR / "extra_credit_scenario_summary.csv"
 FIGURE_SEASONAL = FIGURE_DIR / "extra_credit_seasonal_comparison.png"
@@ -56,11 +57,38 @@ def read_metrics():
         rows = list(csv.DictReader(source))
     if not rows:
         raise ValueError(f"No model comparison rows found in {SOURCE}")
+    scenario_tests = {
+        "SAME_YEAR_CDL -> PREVIOUS_CDL": "PREVIOUS_CDL",
+        "SAME_YEAR_CDL -> FINAL_CDL": "FINAL_CDL",
+        "SAME_YEAR_CDL -> CLEAN_REBUILT": "CLEAN_REBUILT",
+        "SAME_YEAR_CDL -> STUDY": "STUDY",
+    }
+    normalized = []
     for row in rows:
-        for column in ("year", "doy", "rmse_mean", "rmse_std", "mae_mean", "r2_mean", "anomaly_r2_mean"):
-            if row[column] == "":
+        testing_mask = scenario_tests.get(row.get("scenario", ""))
+        if testing_mask is None:
+            raise ValueError(f"Unexpected scenario in v5_out summary: {row.get('scenario')}")
+        if row.get("year") == "ALL" or row.get("doy") == "ALL":
+            continue
+        required = ("year", "doy", "rmse_mean", "rmse_sd", "mae_mean", "r2_mean", "anomaly_r2_mean")
+        for column in required:
+            if not row.get(column):
                 raise ValueError(f"Missing {column} in model summary row: {row}")
-    return rows
+        normalized.append({
+            **row,
+            "training_mask": "SAME_YEAR_CDL",
+            "testing_mask": testing_mask,
+            "scenario": {
+                "PREVIOUS_CDL": SCENARIO_ORDER[0],
+                "FINAL_CDL": SCENARIO_ORDER[1],
+                "CLEAN_REBUILT": SCENARIO_ORDER[2],
+                "STUDY": SCENARIO_ORDER[3],
+            }[testing_mask],
+            "rmse_std": row["rmse_sd"],
+        })
+    if not normalized:
+        raise ValueError(f"No year/date model comparison rows found in {SOURCE}")
+    return normalized
 
 
 def summarize(rows):
@@ -428,7 +456,7 @@ def make_docx(summaries, source_rows, delta_mean, delta_sd, n_paired):
             style="Caption", size=15, color="526575", after=100,
         ),
         xml_paragraph(
-            "Source: v5_50_seed_all_in_one/summary/seed_summary_mean_sd.csv. The seed-level metrics are summarized "
+            "Source: v5_out/summary/seed_summary_mean_sd.csv. The seed-level metrics are summarized "
             "by scenario, year, and DOY; reported seed counts are 50 per group.",
             italic=True, size=14, color="526575", after=0,
         ),

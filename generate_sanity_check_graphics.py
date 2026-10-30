@@ -18,11 +18,11 @@ from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 
 
 ROOT = Path(__file__).resolve().parent
-DATA_ROOT = ROOT / "v5_50_seed_all_in_one" / "v5_50_seed_all_in_one"
+DATA_ROOT = ROOT / "v5_out"
 PREDICTIONS = DATA_ROOT / "summary" / "ensemble_county_predictions.csv"
 SEED_PREDICTIONS = DATA_ROOT / "seeds" / "seed_1" / "county_predictions.csv"
-SEED_METRICS = DATA_ROOT / "summary" / "all_seed_metrics.csv"
-OUTPUT_DIR = ROOT / "sanity_check_graphics"
+SEED_COMPARISON = DATA_ROOT / "seeds" / "seed_1" / "corrected_study_vs_our.csv"
+OUTPUT_DIR = DATA_ROOT / "figs" / "sanity_check_graphics"
 TRAINING_MASK = "SAME_YEAR_CDL"
 TESTING_MASK = "STUDY"
 PRIMARY_LIMIT_PERCENT = 10.0
@@ -34,8 +34,8 @@ HAND_CHECK_SEED = 1
 COLORS = {
     "model": "#176B87",
     "trend": "#D28A28",
-    "good": "#39836C",
-    "warn": "#B75B47",
+    "good": "#39826C",
+    "warn": "#B45C48",
     "ink": "#183544",
     "muted": "#526876",
     "grid": "#DFE7EC",
@@ -44,7 +44,7 @@ COLORS = {
 YEAR_COLORS = {
     2021: "#176B87",
     2022: "#D28A28",
-    2023: "#39836C",
+    2023: "#39826C",
     2024: "#8466A5",
     2025: "#B45C48",
 }
@@ -100,8 +100,6 @@ def load_ensemble():
         }
         if item["actual"] <= 0:
             raise ValueError(f"Nonpositive observed yield at {item['year']}/{item['doy']}/{item['fips']}; MAPE is undefined.")
-        if item["predicted"] < 0:
-            raise ValueError(f"Negative predicted yield at {item['year']}/{item['doy']}/{item['fips']}.")
         if item["n_seeds"] != 50:
             raise ValueError(f"Expected 50 seeds, found {item['n_seeds']} at {item['year']}/{item['doy']}.")
         result.append(item)
@@ -176,18 +174,19 @@ def independently_verify_metrics():
         (observed - mean_actual) ** 2 for observed in actual
     )
     stored = [
-        row for row in read_csv(SEED_METRICS)
-        if (row["training_mask"], row["testing_mask"], row["year"], row["doy"], row["seed"])
-        == (TRAINING_MASK, TESTING_MASK, str(HAND_CHECK_YEAR), str(HAND_CHECK_DOY), str(HAND_CHECK_SEED))
+        row for row in read_csv(SEED_COMPARISON)
+        if (row["training_mask_study"], row["testing_mask_study"], row["year"], row["doy"])
+        == (TRAINING_MASK, TESTING_MASK, str(HAND_CHECK_YEAR), str(HAND_CHECK_DOY))
     ]
     if len(stored) != 1:
-        raise ValueError(f"Expected one stored audit-metric row; found {len(stored)}.")
+        raise ValueError(f"Expected one seed-{HAND_CHECK_SEED} published-mask audit row; found {len(stored)}.")
     stored = stored[0]
 
     calculated = {"rmse": rmse, "mae": mae, "r2": r2}
+    stored_fields = {"rmse": "rmse_study", "mae": "mae_study", "r2": "r2_study"}
     discrepancies = {}
     for name, value in calculated.items():
-        target = float(stored[name])
+        target = float(stored[stored_fields[name]])
         difference_percent = abs(value - target) / max(abs(target), 1e-15) * 100
         discrepancies[name] = difference_percent
         if not math.isclose(value, target, rel_tol=1e-11, abs_tol=1e-12):
@@ -211,7 +210,7 @@ def independently_verify_metrics():
         "rmse": rmse,
         "mae": mae,
         "r2": r2,
-        "stored": {name: float(stored[name]) for name in calculated},
+        "stored": {name: float(stored[stored_fields[name]]) for name in calculated},
         "discrepancies": discrepancies,
         "table": table_rows,
     }
@@ -443,7 +442,7 @@ def make_hand_check_figure(check, records):
         cell.set_edgecolor("#CFD9DF")
         cell.set_linewidth(0.7)
         if row == 0:
-            cell.set_facecolor("#39836C")
+            cell.set_facecolor("#39826C")
             cell.get_text().set_color("white")
             cell.get_text().set_fontweight("bold")
         else:
@@ -459,7 +458,7 @@ def make_hand_check_figure(check, records):
     )
     fig.text(
         0.055, 0.045,
-        f"Boundary check across {len(records):,} county-date predictions: "
+        f"Boundary check across {len(records):,} county-date predictions (negative outputs are preserved, not clipped): "
         f"{sum(row['predicted'] < 0 for row in records)} negative predictions; "
         f"observed yields {min(row['actual'] for row in records):.1f}–{max(row['actual'] for row in records):.1f} bu/ac; "
         f"model predictions {min(row['predicted'] for row in records):.2f}–{max(row['predicted'] for row in records):.2f} bu/ac.",
@@ -555,6 +554,9 @@ def main():
     print(f"Pooled R2: {pooled['r2']:.3f}; all year/date R2 values exceed {R2_LIMIT:.2f}.")
     print(f"Pooled model/trend RMSE: {pooled['rmse_model']:.2f}/{pooled['rmse_trend']:.2f} bu/ac.")
     print(f"Independent seed-{HAND_CHECK_SEED} audit relative differences: {hand_check['discrepancies']}.")
+    negative_count = sum(row["predicted"] < 0 for row in rows)
+    if negative_count:
+        print(f"WARNING: {negative_count} published-mask county-date ensemble prediction(s) are below zero; inspect the boundary-check figure.")
     print(f"Created {pdf_path}")
     for filename in figure_names:
         print(OUTPUT_DIR / filename)

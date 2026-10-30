@@ -17,36 +17,36 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parent
-DATA_ROOT = ROOT / "v5_50_seed_all_in_one" / "v5_50_seed_all_in_one"
+DATA_ROOT = ROOT / "v5_out"
 SUMMARY_DIR = DATA_ROOT / "summary"
 PREDICTIONS_FILE = SUMMARY_DIR / "ensemble_county_predictions.csv"
-IMPORTANCE_FILE = SUMMARY_DIR / "SAME_YEAR_CDL_mean_feature_importance.csv"
-OUTPUT_DIR = ROOT / "final_poster_graphics"
+IMPORTANCE_DIR = DATA_ROOT / "seeds"
+OUTPUT_DIR = DATA_ROOT / "figs" / "final_poster_graphics"
 TARGET_DOYS = (193, 209, 225, 241, 257, 273)
 TRAINING_MASK = "SAME_YEAR_CDL"
 TESTING_MASK = "STUDY"
 
 COLORS = {
     "navy": "#123746",
-    "blue": "#19718C",
+    "blue": "#176B87",
     "blue_light": "#E8F2F6",
-    "teal": "#2E806E",
+    "teal": "#39826C",
     "teal_light": "#E9F3EF",
-    "gold": "#D18A2E",
+    "gold": "#D28A28",
     "gold_light": "#F8F1E5",
-    "coral": "#B9503D",
+    "coral": "#B45C48",
     "ink": "#203744",
     "muted": "#506674",
     "grid": "#DEE7EC",
-    "gray": "#82929D",
+    "gray": "#778391",
     "white": "#FFFFFF",
 }
 YEAR_COLORS = {
-    2021: "#19718C",
-    2022: "#D18A2E",
-    2023: "#2E806E",
-    2024: "#8065A6",
-    2025: "#B9503D",
+    2021: "#176B87",
+    2022: "#D28A28",
+    2023: "#39826C",
+    2024: "#8466A5",
+    2025: "#B45C48",
 }
 
 plt.rcParams.update({
@@ -353,10 +353,35 @@ def display_feature_name(name):
 
 
 def make_feature_figure():
-    rows = read_csv(IMPORTANCE_FILE)
-    if not rows or not {"feature", "mean_gain_share"}.issubset(rows[0]):
-        raise ValueError("Feature importance file is missing its expected columns.")
-    ranked = sorted(rows, key=lambda row: float(row["mean_gain_share"]), reverse=True)[:8]
+    target_year, target_doy = 2025, 273
+    feature_rows = defaultdict(list)
+    seed_count = 0
+    for seed_dir in sorted(IMPORTANCE_DIR.glob("seed_*"), key=lambda path: int(path.name.split("_")[1])):
+        source = seed_dir / "feature_importance" / "feature_importance.csv"
+        if not source.is_file():
+            raise FileNotFoundError(f"Required feature importance file not found: {source}")
+        rows = read_csv(source)
+        selected = [
+            row for row in rows
+            if row["training_mask"] == TRAINING_MASK
+            and int(row["year"]) == target_year
+            and int(row["doy"]) == target_doy
+        ]
+        if not selected:
+            raise ValueError(f"No {target_year}/DOY {target_doy} feature importances found in {source}")
+        seed_count += 1
+        for row in selected:
+            feature_rows[row["feature"]].append(float(row["gain_share"]))
+    if seed_count != 50:
+        raise ValueError(f"Expected feature importance for 50 seeds; found {seed_count}.")
+    ranked = sorted(
+        (
+            {"feature": feature, "mean_gain_share": math.fsum(values) / seed_count}
+            for feature, values in feature_rows.items()
+        ),
+        key=lambda row: row["mean_gain_share"],
+        reverse=True,
+    )[:8]
     labels = [display_feature_name(row["feature"]) for row in reversed(ranked)]
     shares = [100 * float(row["mean_gain_share"]) for row in reversed(ranked)]
     palette = [COLORS["gray"] if "trend" in label.lower() or label == "Crop year" else COLORS["blue"] for label in labels]
@@ -379,7 +404,8 @@ def make_feature_figure():
     ax.tick_params(axis="y", labelsize=22, pad=10)
     fig.text(
         0.06, 0.015,
-        "50 same-year CDL-trained models; top 8 of 241 features. Importance reflects model use, not causation.\n"
+        f"50 same-year CDL-trained models for {target_year} DOY {target_doy}; top 8 of {len(feature_rows)} features. "
+        "Importance reflects model use, not causation.\n"
         "GCI, EVI2, NIRv, and NDMI are satellite crop-health signals; VPD measures atmospheric dryness.",
         fontsize=17.5, color=COLORS["muted"],
     )
