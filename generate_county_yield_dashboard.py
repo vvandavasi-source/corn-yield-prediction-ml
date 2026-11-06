@@ -6,6 +6,8 @@ import json
 import math
 from collections import defaultdict
 from pathlib import Path
+import json
+import urllib.request
 
 
 ROOT = Path(__file__).resolve().parent
@@ -41,16 +43,34 @@ STATE_NAMES = {
 
 def load_county_names():
     names = {}
-    if not NASS_FILE.is_file():
-        return names
-    with NASS_FILE.open(newline="", encoding="utf-8-sig") as source:
-        for row in csv.DictReader(source):
-            if row.get("Crop type", "").strip().lower() != "corn":
-                continue
-            code = row.get("FIPS", "").strip().zfill(5)
-            location = row.get("Location", "").strip()
-            if len(code) == 5 and code.isdigit() and location:
-                names.setdefault(code, location.split(",")[-1].strip().title())
+
+    # 1. Fetch official county names directly from Plotly's GeoJSON dataset
+    try:
+        req = urllib.request.Request(
+            COUNTY_GEOJSON_URL,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            geojson_data = json.loads(response.read().decode("utf-8"))
+            for feature in geojson_data.get("features", []):
+                fips = str(feature.get("id", "")).zfill(5)
+                county_name = feature.get("properties", {}).get("NAME")
+                if fips and county_name:
+                    names[fips] = county_name
+        if names:
+            return names
+    except Exception as e:
+        print(f"Notice: Could not fetch Plotly GeoJSON names online ({e}). Attempting local NASS file...")
+
+    # 2. Fallback to NASS CSV file if available
+    if NASS_FILE.is_file():
+        with NASS_FILE.open(newline="", encoding="utf-8-sig") as source:
+            for row in csv.DictReader(source):
+                code = row.get("FIPS", "").strip().zfill(5)
+                location = row.get("Location", "").strip()
+                if len(code) == 5 and code.isdigit() and location:
+                    names.setdefault(code, location.split(",")[-1].strip().title())
+
     return names
 
 
@@ -115,8 +135,64 @@ def read_seed_predictions():
     return records
 
 
-def write_dashboard(records):
+def read_feature_importance():
+    importance_by_feature = defaultdict(list)
+    feature_groups = {}
+    for seed_file in sorted(SEEDS_DIR.glob("seed_*/feature_importance/feature_importance.csv")):
+        seen = set()
+        with seed_file.open(newline="", encoding="utf-8-sig") as source:
+            reader = csv.DictReader(source)
+            required = {"training_mask", "year", "doy", "feature", "group", "gain_share"}
+            missing = required - set(reader.fieldnames or [])
+            if missing:
+                raise ValueError(f"{seed_file} is missing columns: {', '.join(sorted(missing))}")
+            for row in reader:
+                if row["training_mask"] != "SAME_YEAR_CDL":
+                    continue
+                year = int(row["year"])
+                doy = int(row["doy"])
+                feature = row["feature"].strip()
+                group = row["group"].strip()
+                gain_share = float(row["gain_share"])
+                key = (year, doy, feature)
+                if not feature or not group or not math.isfinite(gain_share) or gain_share < 0:
+                    raise ValueError(f"Invalid feature importance value in {seed_file}: {row}")
+                if key in seen:
+                    raise ValueError(f"Duplicate feature importance row for {key} in {seed_file}")
+                if key in feature_groups and feature_groups[key] != group:
+                    raise ValueError(f"Inconsistent feature group for {key} in {seed_file}")
+                seen.add(key)
+                feature_groups[key] = group
+                importance_by_feature[key].append(gain_share)
+
+    if not importance_by_feature:
+        raise ValueError(f"No same-year CDL feature importance rows found in {SEEDS_DIR}")
+
+    by_year_date = defaultdict(list)
+    for (year, doy, feature), values in importance_by_feature.items():
+        count = len(values)
+        mean = sum(values) / count
+        variance = sum((value - mean) ** 2 for value in values) / (count - 1) if count > 1 else 0.0
+        by_year_date[(year, doy)].append({
+            "y": year,
+            "d": doy,
+            "f": feature,
+            "g": feature_groups[(year, doy, feature)],
+            "v": round(mean * 100, 5),
+            "sd": round(math.sqrt(variance) * 100, 5),
+            "n": count,
+        })
+
+    return [
+        feature
+        for rows in by_year_date.values()
+        for feature in sorted(rows, key=lambda row: (-row["v"], row["f"]))[:15]
+    ]
+
+
+def write_dashboard(records, features):
     payload = json.dumps(records, separators=(",", ":"), ensure_ascii=False).replace("<", "\\u003c")
+    feature_payload = json.dumps(features, separators=(",", ":"), ensure_ascii=False).replace("<", "\\u003c")
     scenarios = sorted(
         {row["s"] for row in records},
         key=lambda scenario: (0 if "study testing" in scenario.lower() else 1, scenario),
@@ -173,11 +249,14 @@ def write_dashboard(records):
     .map-controls { display:flex; align-items:center; gap:10px; margin:8px 10px 0; }
     .map-controls label { min-width:150px; }
     .map-controls select { max-width:180px; }
+    .map-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
     .map-summary { margin:8px 10px 0; color:var(--ink); font-size:13px; font-weight:600; }
     .map-status { min-height:18px; margin:2px 10px 0; color:#8a3d32; font-size:12px; }
-    #countyMap { height:610px; }
+    .map-chart { height:500px; }
+    .feature-chart { height:470px; }
     .note { margin:14px 2px 0; color:var(--muted); font-size:12px; }
     .warning { display:none; margin:12px 0; padding:12px; border:1px solid #f1c27d; border-radius:6px; background:#fff8e9; color:#664b1c; }
+    @media (max-width:1000px) { .map-grid { grid-template-columns:1fr; } .map-chart { height:430px; } }
     @media (max-width:850px) { .controls { grid-template-columns:1fr 1fr; } .grid { grid-template-columns:1fr; } .wide { grid-column:auto; } .kpis { grid-template-columns:1fr 1fr; } }
     @media (max-width:520px) { .controls { grid-template-columns:1fr; } header { padding:22px 20px; } .chart { height:340px; } }
   </style>
@@ -203,14 +282,26 @@ def write_dashboard(records):
     </section>
     <section class="grid">
       <article class="panel wide">
-        <h2>Predicted yield by county</h2>
-        <p>National overview for the selected training/testing scenario and year. Hover a county for predicted and observed yield, error, historical trend, and seed spread. The map is independent of the state filter used by the charts below.</p>
+        <h2>National county maps</h2>
+        <p>Both maps use the selected scenario, year, and map date; they remain national overviews regardless of the state filter used by charts below.</p>
         <div class="map-controls">
           <label>Map observation date<select id="mapDoy">__MAP_DAYS__</select></label>
         </div>
         <p id="mapSummary" class="map-summary"></p>
-        <div id="mapStatus" class="map-status" role="status" aria-live="polite"></div>
-        <div id="countyMap" class="chart"></div>
+        <div class="map-grid">
+          <div>
+            <h2>Predicted yield</h2>
+            <p>White-to-green scale; hover for prediction, observed yield, error, and seed spread.</p>
+            <div id="yieldMapStatus" class="map-status" role="status" aria-live="polite"></div>
+            <div id="countyMap" class="map-chart"></div>
+          </div>
+          <div>
+            <h2>Signed prediction error</h2>
+            <p>Red = underprediction; green = overprediction; white = near zero.</p>
+            <div id="errorMapStatus" class="map-status" role="status" aria-live="polite"></div>
+            <div id="countyErrorMap" class="map-chart"></div>
+          </div>
+        </div>
       </article>
       <article class="panel">
         <h2>County yield through the season</h2>
@@ -232,11 +323,17 @@ def write_dashboard(records):
         <p>County-averaged MAE and RMSE; county count is shown in hover details.</p>
         <div id="accuracyChart" class="chart"></div>
       </article>
+      <article class="panel wide">
+        <h2>Top model features for selected year/date</h2>
+        <p>Mean feature gain share across available same-year CDL seed models; bars show seed-to-seed standard deviation. Importance is descriptive, not causal.</p>
+        <div id="featureChart" class="feature-chart"></div>
+      </article>
     </section>
-    <p class="note">The seed spread is the sample standard deviation of predictions across available model seeds, not a confidence interval. State metrics give each available county equal weight. Missing counties/dates are not imputed. The final-CDL scenario uses hindsight inputs and is a benchmark, not a like-for-like operational forecast.</p>
+    <p class="note">The seed spread is the sample standard deviation of predictions across available model seeds, not a confidence interval. Feature importance is averaged across fitted same-year CDL training models and is independent of the selected test-mask scenario; its error bars show standard deviation across seeds, not a confidence interval. State metrics give each available county equal weight. Missing counties/dates are not imputed. The final-CDL scenario uses hindsight inputs and is a benchmark, not a like-for-like operational forecast.</p>
   </main>
   <script>
     const rows = __DATA__;
+    const features = __FEATURES__;
     const scenarioSelect = document.getElementById("scenario");
     const stateSelect = document.getElementById("state");
     const countySelect = document.getElementById("county");
@@ -317,29 +414,45 @@ def write_dashboard(records):
       const mapRows = rows.filter(r =>
         r.s === scenarioSelect.value && r.y === year && r.d === doy
       );
-      const status = document.getElementById("mapStatus");
+      const yieldStatus = document.getElementById("yieldMapStatus");
+      const errorStatus = document.getElementById("errorMapStatus");
       document.getElementById("mapSummary").textContent =
         `${scenarioSelect.value} · ${year} · DOY ${doy} · ${mapRows.length.toLocaleString()} counties across ${new Set(mapRows.map(r => r.sc)).size} states. Color scale is fixed across dates for this scenario and year.`;
       if (!mapRows.length) {
         renderedMapKey = "";
-        status.textContent = "No county predictions are available for this map selection.";
+        yieldStatus.textContent = "No county predictions are available for this map selection.";
+        errorStatus.textContent = "No county errors are available for this map selection.";
         Plotly.purge("countyMap");
+        Plotly.purge("countyErrorMap");
         return;
       }
       const mapKey = `${scenarioSelect.value}|${year}|${doy}`;
       if (mapKey === renderedMapKey) return;
-      status.textContent = "";
+      yieldStatus.textContent = "";
+      errorStatus.textContent = "";
       const rangeRows = rows.filter(r => r.s === scenarioSelect.value && r.y === year);
-      const values = rangeRows.map(r => r.p);
       const customdata = mapRows.map(r => [r.c, r.st, r.f, r.a, r.p-r.a, Math.abs(r.p-r.a), r.t, r.sd, r.n]);
-      Plotly.react("countyMap", [{
+      const errorCustomdata = mapRows.map(r => [r.c, r.st, r.f, r.p, r.a, r.p-r.a, Math.abs(r.p-r.a), r.t, r.sd, r.n]);
+      const yieldValues = rangeRows.map(r => r.p);
+      const errorLimit = Math.max(1, ...rangeRows.map(r => Math.abs(r.p-r.a)));
+      const geoLayout = {
+        autosize:true,paper_bgcolor:"#fff",plot_bgcolor:"#fff",
+        font:{family:"Segoe UI, Arial, sans-serif",color:"#304657",size:12},
+        margin:{l:0,r:0,t:8,b:0},
+        geo:{
+          scope:"usa",projection:{type:"albers usa"},fitbounds:"locations",
+          showland:true,landcolor:"#f5f7f8",showlakes:true,lakecolor:"#fff",
+          showcountries:false,showsubunits:true,subunitcolor:"#b9c7ce"
+        }
+      };
+      const yieldPromise = Plotly.react("countyMap", [{
         type:"choropleth",
         geojson:__COUNTY_GEOJSON_URL__,
         featureidkey:"id",
         locations:mapRows.map(r => r.f),
         z:mapRows.map(r => r.p),
-        zmin:Math.min(...values),
-        zmax:Math.max(...values),
+        zmin:Math.min(...yieldValues),
+        zmax:Math.max(...yieldValues),
         colorscale:[[0,"#FFFFFF"],[0.2,"#E9F3EF"],[0.5,"#AFCFC0"],[0.8,"#67A287"],[1,"#28634E"]],
         marker:{line:{color:"#ffffff",width:0.25}},
         colorbar:{title:{text:"Yield<br>(bu/ac)"},thickness:18},
@@ -355,21 +468,40 @@ def write_dashboard(records):
           "Historical trend: %{customdata[6]:.1f} bu/ac<br>" +
           "Seed SD (not a confidence interval): %{customdata[7]:.2f} bu/ac<br>" +
           "Seeds: %{customdata[8]}<extra></extra>"
-      }],{
-        autosize:true,paper_bgcolor:"#fff",plot_bgcolor:"#fff",
-        font:{family:"Segoe UI, Arial, sans-serif",color:"#304657",size:12},
-        margin:{l:0,r:0,t:8,b:0},
-        geo:{
-          scope:"usa",projection:{type:"albers usa"},fitbounds:"locations",
-          showland:true,landcolor:"#f5f7f8",showlakes:true,lakecolor:"#fff",
-          showcountries:false,showsubunits:true,subunitcolor:"#b9c7ce"
-        }
-      },plotConfig).then(() => {
+      }],geoLayout,plotConfig);
+      const errorPromise = Plotly.react("countyErrorMap", [{
+        type:"choropleth",
+        geojson:__COUNTY_GEOJSON_URL__,
+        featureidkey:"id",
+        locations:mapRows.map(r => r.f),
+        z:mapRows.map(r => r.p-r.a),
+        zmin:-errorLimit,
+        zmax:errorLimit,
+        zmid:0,
+        colorscale:[[0,"#A8443D"],[0.35,"#E6B8B1"],[0.5,"#FFFFFF"],[0.65,"#B8D3C5"],[1,"#39826C"]],
+        marker:{line:{color:"#ffffff",width:0.25}},
+        colorbar:{title:{text:"Error<br>(bu/ac)"},thickness:18},
+        customdata:errorCustomdata,
+        hovertemplate:
+          "<b>%{customdata[0]}, %{customdata[1]}</b><br>" +
+          "FIPS: %{customdata[2]}<br>" +
+          `Year ${year} · DOY ${doy}<br>` +
+          "Signed error (predicted − observed): %{z:.1f} bu/ac<br>" +
+          "Absolute error: %{customdata[6]:.1f} bu/ac<br>" +
+          "Predicted yield: %{customdata[3]:.1f} bu/ac<br>" +
+          "Observed yield: %{customdata[4]:.1f} bu/ac<br>" +
+          "Historical trend: %{customdata[7]:.1f} bu/ac<br>" +
+          "Seed SD (not a confidence interval): %{customdata[8]:.2f} bu/ac<br>" +
+          "Seeds: %{customdata[9]}<extra></extra>"
+      }],geoLayout,plotConfig);
+      Promise.all([yieldPromise,errorPromise]).then(() => {
         renderedMapKey = mapKey;
       }).catch(error => {
         renderedMapKey = "";
-        console.error("County yield map failed to render.",error);
-        status.textContent = "Map could not be loaded. Check your internet connection and reload; county boundary data is loaded from Plotly's public GeoJSON.";
+        console.error("County yield or error map failed to render.",error);
+        const message = "Map could not be loaded. Check your internet connection and reload; county boundary data is loaded from Plotly's public GeoJSON.";
+        if (!document.querySelector("#countyMap .choroplethlocation")) yieldStatus.textContent = message;
+        if (!document.querySelector("#countyErrorMap .choroplethlocation")) errorStatus.textContent = message;
       });
     }
     function dateLabels(doys) {
@@ -453,6 +585,22 @@ def write_dashboard(records):
         ...commonLayout,hovermode:"x unified",xaxis:{...commonLayout.xaxis,title:"Observation date",tickangle:-18},
         yaxis:{...commonLayout.yaxis,title:"Error (bu/acre)",rangemode:"tozero"}
       },plotConfig);
+
+      const selectedFeatures = features.filter(f => f.y === Number(yearSelect.value) && f.d === Number(mapDoySelect.value));
+      Plotly.react("featureChart",[{
+        type:"bar",orientation:"h",
+        x:selectedFeatures.map(f=>f.v),
+        y:selectedFeatures.map(f=>f.f),
+        marker:{color:palette.predicted},
+        error_x:{type:"data",array:selectedFeatures.map(f=>f.sd),visible:true,color:"#526574",thickness:1.2},
+        customdata:selectedFeatures.map(f=>[f.g,f.sd,f.n]),
+        hovertemplate:"%{y}<br>Mean gain share %{x:.3f}%<br>Seed SD %{customdata[1]:.3f}%<br>Feature group: %{customdata[0]}<br>Seeds n=%{customdata[2]}<extra></extra>"
+      }],{
+        ...commonLayout,margin:{l:190,r:24,t:18,b:56},hovermode:"closest",
+        xaxis:{...commonLayout.xaxis,title:"Mean gain share across seeds (%)",rangemode:"tozero"},
+        yaxis:{...commonLayout.yaxis,autorange:"reversed",automargin:true},
+        showlegend:false
+      },plotConfig);
     }
     for (const control of [scenarioSelect,stateSelect,countySelect,yearSelect,mapDoySelect]) control.addEventListener("change",render);
     render();
@@ -466,17 +614,20 @@ def write_dashboard(records):
     page = page.replace("__MAP_DAYS__", map_day_options)
     page = page.replace("__COUNTY_GEOJSON_URL__", json.dumps(COUNTY_GEOJSON_URL))
     page = page.replace("__DATA__", payload)
+    page = page.replace("__FEATURES__", feature_payload)
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT_FILE.write_text(page, encoding="utf-8")
 
 
 def main():
     records = read_seed_predictions()
-    write_dashboard(records)
+    features = read_feature_importance()
+    write_dashboard(records, features)
     state_count = len({record["sc"] for record in records})
     county_count = len({record["f"] for record in records})
     print(f"Wrote {OUTPUT_FILE}")
     print(f"Embedded {len(records):,} county-date-scenario records for {county_count:,} counties across {state_count} states.")
+    print(f"Embedded {len(features):,} top-feature summaries across available year/date groups.")
 
 
 if __name__ == "__main__":
