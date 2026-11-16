@@ -250,6 +250,7 @@ def write_dashboard(records, features):
     .map-controls label { min-width:150px; }
     .map-controls select { max-width:180px; }
     .map-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .map-grid + .map-grid { margin-top:12px; }
     .map-summary { margin:8px 10px 0; color:var(--ink); font-size:13px; font-weight:600; }
     .map-status { min-height:18px; margin:2px 10px 0; color:#8a3d32; font-size:12px; }
     .map-chart { height:500px; }
@@ -283,7 +284,7 @@ def write_dashboard(records, features):
     <section class="grid">
       <article class="panel wide">
         <h2>National county maps</h2>
-        <p>Both maps use the selected scenario, year, and map date; they remain national overviews regardless of the state filter used by charts below.</p>
+        <p>All maps use the selected scenario, year, and map date; they remain national overviews regardless of the state filter used by charts below.</p>
         <div class="map-controls">
           <label>Map observation date<select id="mapDoy">__MAP_DAYS__</select></label>
         </div>
@@ -300,6 +301,20 @@ def write_dashboard(records, features):
             <p>Red = underprediction; green = overprediction; white = near zero.</p>
             <div id="errorMapStatus" class="map-status" role="status" aria-live="polite"></div>
             <div id="countyErrorMap" class="map-chart"></div>
+          </div>
+        </div>
+        <div class="map-grid">
+          <div>
+            <h2>95% confidence interval for mean predicted yield</h2>
+            <p>Green = narrower interval; red = wider interval; hover for lower and upper yield bounds.</p>
+            <div id="intervalMapStatus" class="map-status" role="status" aria-live="polite"></div>
+            <div id="countyIntervalMap" class="map-chart"></div>
+          </div>
+          <div>
+            <h2>Coefficient of variation in predicted yield</h2>
+            <p>Seed standard deviation ÷ absolute mean prediction; green = lower variation, red = higher variation.</p>
+            <div id="cvMapStatus" class="map-status" role="status" aria-live="polite"></div>
+            <div id="countyCvMap" class="map-chart"></div>
           </div>
         </div>
       </article>
@@ -350,6 +365,7 @@ def write_dashboard(records, features):
       legend:{orientation:"h",y:1.12,x:0}
     };
     const plotConfig = {responsive:true,displaylogo:false};
+    const tCriticalBySampleSize = [NaN,12.70620474,4.30265273,3.18244631,2.77644511,2.57058184,2.44691185,2.36462425,2.30600414,2.26215716,2.22813885,2.20098516,2.17881283,2.16036866,2.14478669,2.13144955,2.11990530,2.10981558,2.10092204,2.09302405,2.08596345,2.07961384,2.07387307,2.06865761,2.06389856,2.05953855,2.05552944,2.05183052,2.04840714,2.04522964,2.04227246,2.03951345,2.03693334,2.03451530,2.03224451,2.03010793,2.02809400,2.02619246,2.02439416,2.02269092,2.02107539,2.01954097,2.01808170,2.01669220,2.01536757,2.01410339,2.01289560,2.01174051,2.01063476,2.00957524];
     const round = value => Number.isFinite(value) ? value.toFixed(1) : "—";
     const byDoy = (a,b) => a.d-b.d;
     function filteredRows() {
@@ -416,25 +432,48 @@ def write_dashboard(records, features):
       );
       const yieldStatus = document.getElementById("yieldMapStatus");
       const errorStatus = document.getElementById("errorMapStatus");
+      const intervalStatus = document.getElementById("intervalMapStatus");
+      const cvStatus = document.getElementById("cvMapStatus");
       document.getElementById("mapSummary").textContent =
         `${scenarioSelect.value} · ${year} · DOY ${doy} · ${mapRows.length.toLocaleString()} counties across ${new Set(mapRows.map(r => r.sc)).size} states. Color scale is fixed across dates for this scenario and year.`;
       if (!mapRows.length) {
         renderedMapKey = "";
         yieldStatus.textContent = "No county predictions are available for this map selection.";
         errorStatus.textContent = "No county errors are available for this map selection.";
+        intervalStatus.textContent = "No county confidence intervals are available for this map selection.";
+        cvStatus.textContent = "No county coefficients of variation are available for this map selection.";
         Plotly.purge("countyMap");
         Plotly.purge("countyErrorMap");
+        Plotly.purge("countyIntervalMap");
+        Plotly.purge("countyCvMap");
         return;
       }
       const mapKey = `${scenarioSelect.value}|${year}|${doy}`;
       if (mapKey === renderedMapKey) return;
       yieldStatus.textContent = "";
       errorStatus.textContent = "";
+      intervalStatus.textContent = "";
+      cvStatus.textContent = "";
       const rangeRows = rows.filter(r => r.s === scenarioSelect.value && r.y === year);
       const customdata = mapRows.map(r => [r.c, r.st, r.f, r.a, r.p-r.a, Math.abs(r.p-r.a), r.t, r.sd, r.n]);
       const errorCustomdata = mapRows.map(r => [r.c, r.st, r.f, r.p, r.a, r.p-r.a, Math.abs(r.p-r.a), r.t, r.sd, r.n]);
       const yieldValues = rangeRows.map(r => r.p);
       const errorLimit = Math.max(1, ...rangeRows.map(r => Math.abs(r.p-r.a)));
+      const intervalStats = mapRows.map(r => {
+        const critical = tCriticalBySampleSize[r.n - 1];
+        const margin = r.n > 1 && Number.isFinite(critical) ? critical * r.sd / Math.sqrt(r.n) : NaN;
+        const lower = Number.isFinite(margin) ? r.p - margin : NaN;
+        const upper = Number.isFinite(margin) ? r.p + margin : NaN;
+        return {lower, upper, width: upper - lower};
+      });
+      const intervalWidths = intervalStats.map(value => value.width).filter(Number.isFinite);
+      const intervalMin = intervalWidths.length ? Math.min(...intervalWidths) : 0;
+      const intervalMax = intervalWidths.length ? Math.max(...intervalWidths) : 1;
+      const cvValues = mapRows.map(r => r.p !== 0 ? 100 * r.sd / Math.abs(r.p) : NaN);
+      const finiteCvValues = cvValues.filter(Number.isFinite);
+      const cvMin = finiteCvValues.length ? Math.min(...finiteCvValues) : 0;
+      const cvMax = finiteCvValues.length ? Math.max(...finiteCvValues) : 1;
+      const intervalDisplay = value => Number.isFinite(value) ? value.toFixed(1) : "Unavailable";
       const geoLayout = {
         autosize:true,paper_bgcolor:"#fff",plot_bgcolor:"#fff",
         font:{family:"Segoe UI, Arial, sans-serif",color:"#304657",size:12},
@@ -494,14 +533,62 @@ def write_dashboard(records, features):
           "Seed SD (not a confidence interval): %{customdata[8]:.2f} bu/ac<br>" +
           "Seeds: %{customdata[9]}<extra></extra>"
       }],geoLayout,plotConfig);
-      Promise.all([yieldPromise,errorPromise]).then(() => {
+      const intervalPromise = Plotly.react("countyIntervalMap", [{
+        type:"choropleth",
+        geojson:__COUNTY_GEOJSON_URL__,
+        featureidkey:"id",
+        locations:mapRows.map(r => r.f),
+        z:intervalStats.map(value => value.width),
+        zmin:intervalMin,
+        zmax:intervalMax > intervalMin ? intervalMax : intervalMin + 1,
+        colorscale:[[0,"#39826C"],[0.5,"#FFFFFF"],[1,"#B9503D"]],
+        marker:{line:{color:"#ffffff",width:0.25}},
+        colorbar:{title:{text:"CI width<br>(bu/ac)"},thickness:18},
+        customdata:mapRows.map((r,index) => [
+          r.c,r.st,r.f,intervalDisplay(intervalStats[index].lower),
+          intervalDisplay(intervalStats[index].upper),intervalDisplay(intervalStats[index].width),r.p,r.n
+        ]),
+        hovertemplate:
+          "<b>%{customdata[0]}, %{customdata[1]}</b><br>" +
+          "FIPS: %{customdata[2]}<br>" +
+          `Year ${year} · DOY ${doy}<br>` +
+          "95% CI lower bound: %{customdata[3]} bu/ac<br>" +
+          "95% CI upper bound: %{customdata[4]} bu/ac<br>" +
+          "Interval width: %{customdata[5]} bu/ac<br>" +
+          "Mean predicted yield: %{customdata[6]:.1f} bu/ac<br>" +
+          "Seeds: %{customdata[7]}<extra></extra>"
+      }],geoLayout,plotConfig);
+      const cvPromise = Plotly.react("countyCvMap", [{
+        type:"choropleth",
+        geojson:__COUNTY_GEOJSON_URL__,
+        featureidkey:"id",
+        locations:mapRows.map(r => r.f),
+        z:cvValues,
+        zmin:cvMin,
+        zmax:cvMax > cvMin ? cvMax : cvMin + 1,
+        colorscale:[[0,"#39826C"],[1,"#B9503D"]],
+        marker:{line:{color:"#ffffff",width:0.25}},
+        colorbar:{title:{text:"CV (%)"},thickness:18},
+        customdata:mapRows.map((r,index) => [r.c,r.st,r.f,cvValues[index],r.sd,r.p,r.n]),
+        hovertemplate:
+          "<b>%{customdata[0]}, %{customdata[1]}</b><br>" +
+          "FIPS: %{customdata[2]}<br>" +
+          `Year ${year} · DOY ${doy}<br>` +
+          "Coefficient of variation: %{customdata[3]:.2f}%<br>" +
+          "Seed SD: %{customdata[4]:.2f} bu/ac<br>" +
+          "Mean predicted yield: %{customdata[5]:.1f} bu/ac<br>" +
+          "Seeds: %{customdata[6]}<extra></extra>"
+      }],geoLayout,plotConfig);
+      Promise.all([yieldPromise,errorPromise,intervalPromise,cvPromise]).then(() => {
         renderedMapKey = mapKey;
       }).catch(error => {
         renderedMapKey = "";
-        console.error("County yield or error map failed to render.",error);
+        console.error("County yield, error, confidence interval, or CV map failed to render.",error);
         const message = "Map could not be loaded. Check your internet connection and reload; county boundary data is loaded from Plotly's public GeoJSON.";
         if (!document.querySelector("#countyMap .choroplethlocation")) yieldStatus.textContent = message;
         if (!document.querySelector("#countyErrorMap .choroplethlocation")) errorStatus.textContent = message;
+        if (!document.querySelector("#countyIntervalMap .choroplethlocation")) intervalStatus.textContent = message;
+        if (!document.querySelector("#countyCvMap .choroplethlocation")) cvStatus.textContent = message;
       });
     }
     function dateLabels(doys) {
