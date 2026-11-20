@@ -11,10 +11,10 @@ import urllib.request
 
 
 ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "v5_out"
-SEEDS_DIR = DATA_DIR / "seeds"
-NASS_FILE = ROOT / "NASS_corn_2008_2026-02-05.csv"
-OUTPUT_FILE = DATA_DIR / "summary" / "county_yield_dashboard.html"
+DATA_DIR = ROOT / "seeds_rerun/summary"
+SEEDS_DIR = ROOT / "seeds_rerun"
+NASS_FILE = ROOT / "corn_yield_with_2025_MICHIGAN_ADDED.csv"
+OUTPUT_FILE = ROOT / "county_yield_dashboard.html"
 COUNTY_GEOJSON_URL = "https://raw.githubusercontent.com/plotly/datasets/master/geojson-counties-fips.json"
 
 SCENARIOS = {
@@ -289,32 +289,40 @@ def write_dashboard(records, features):
           <label>Map observation date<select id="mapDoy">__MAP_DAYS__</select></label>
         </div>
         <p id="mapSummary" class="map-summary"></p>
+
+        <div style="margin-bottom: 24px;">
+          <h2>Predicted yield</h2>
+          <p>White-to-green scale; hover for prediction, observed yield, error, and seed spread.</p>
+          <div id="yieldMapStatus" class="map-status" role="status" aria-live="polite"></div>
+          <div id="countyMap" class="map-chart"></div>
+        </div>
+
         <div class="map-grid">
-          <div>
-            <h2>Predicted yield</h2>
-            <p>White-to-green scale; hover for prediction, observed yield, error, and seed spread.</p>
-            <div id="yieldMapStatus" class="map-status" role="status" aria-live="polite"></div>
-            <div id="countyMap" class="map-chart"></div>
-          </div>
           <div>
             <h2>Signed prediction error</h2>
             <p>Red = underprediction; green = overprediction; white = near zero.</p>
             <div id="errorMapStatus" class="map-status" role="status" aria-live="polite"></div>
             <div id="countyErrorMap" class="map-chart"></div>
           </div>
-        </div>
-        <div class="map-grid">
           <div>
             <h2>95% confidence interval for mean predicted yield</h2>
             <p>Green = narrower interval; red = wider interval; hover for lower and upper yield bounds.</p>
             <div id="intervalMapStatus" class="map-status" role="status" aria-live="polite"></div>
             <div id="countyIntervalMap" class="map-chart"></div>
           </div>
+        </div>
+        <div class="map-grid">
           <div>
             <h2>Coefficient of variation in predicted yield</h2>
             <p>Seed standard deviation ÷ absolute mean prediction; green = lower variation, red = higher variation.</p>
             <div id="cvMapStatus" class="map-status" role="status" aria-live="polite"></div>
             <div id="countyCvMap" class="map-chart"></div>
+          </div>
+          <div>
+            <h2>R² (across available years)</h2>
+            <p>Variance explained by the mean prediction. Green = higher accuracy.</p>
+            <div id="r2MapStatus" class="map-status" role="status" aria-live="polite"></div>
+            <div id="countyR2Map" class="map-chart"></div>
           </div>
         </div>
       </article>
@@ -434,26 +442,33 @@ def write_dashboard(records, features):
       const errorStatus = document.getElementById("errorMapStatus");
       const intervalStatus = document.getElementById("intervalMapStatus");
       const cvStatus = document.getElementById("cvMapStatus");
+      const r2Status = document.getElementById("r2MapStatus");
       document.getElementById("mapSummary").textContent =
         `${scenarioSelect.value} · ${year} · DOY ${doy} · ${mapRows.length.toLocaleString()} counties across ${new Set(mapRows.map(r => r.sc)).size} states. Color scale is fixed across dates for this scenario and year.`;
+      
       if (!mapRows.length) {
         renderedMapKey = "";
         yieldStatus.textContent = "No county predictions are available for this map selection.";
         errorStatus.textContent = "No county errors are available for this map selection.";
         intervalStatus.textContent = "No county confidence intervals are available for this map selection.";
         cvStatus.textContent = "No county coefficients of variation are available for this map selection.";
+        r2Status.textContent = "No county R² data is available for this map selection.";
         Plotly.purge("countyMap");
         Plotly.purge("countyErrorMap");
         Plotly.purge("countyIntervalMap");
         Plotly.purge("countyCvMap");
+        Plotly.purge("countyR2Map");
         return;
       }
+      
       const mapKey = `${scenarioSelect.value}|${year}|${doy}`;
       if (mapKey === renderedMapKey) return;
       yieldStatus.textContent = "";
       errorStatus.textContent = "";
       intervalStatus.textContent = "";
       cvStatus.textContent = "";
+      r2Status.textContent = "";
+      
       const rangeRows = rows.filter(r => r.s === scenarioSelect.value && r.y === year);
       const customdata = mapRows.map(r => [r.c, r.st, r.f, r.a, r.p-r.a, Math.abs(r.p-r.a), r.t, r.sd, r.n]);
       const errorCustomdata = mapRows.map(r => [r.c, r.st, r.f, r.p, r.a, r.p-r.a, Math.abs(r.p-r.a), r.t, r.sd, r.n]);
@@ -474,6 +489,21 @@ def write_dashboard(records, features):
       const cvMin = finiteCvValues.length ? Math.min(...finiteCvValues) : 0;
       const cvMax = finiteCvValues.length ? Math.max(...finiteCvValues) : 1;
       const intervalDisplay = value => Number.isFinite(value) ? value.toFixed(1) : "Unavailable";
+      
+      // Calculate R2 across all available years for the selected scenario and DOY
+      const doyRows = rows.filter(r => r.s === scenarioSelect.value && r.d === doy);
+      const r2Values = mapRows.map(r => {
+        const cRows = doyRows.filter(x => x.f === r.f);
+        if (cRows.length < 2) return NaN;
+        const meanA = cRows.reduce((sum, x) => sum + x.a, 0) / cRows.length;
+        const ssTot = cRows.reduce((sum, x) => sum + Math.pow(x.a - meanA, 2), 0);
+        const ssRes = cRows.reduce((sum, x) => sum + Math.pow(x.a - x.p, 2), 0);
+        return ssTot > 0 ? 1 - (ssRes / ssTot) : NaN;
+      });
+      const finiteR2 = r2Values.filter(Number.isFinite);
+      const r2Min = finiteR2.length ? Math.max(-1, Math.min(...finiteR2)) : 0;
+      const r2Max = finiteR2.length ? Math.max(...finiteR2) : 1;
+
       const geoLayout = {
         autosize:true,paper_bgcolor:"#fff",plot_bgcolor:"#fff",
         font:{family:"Segoe UI, Arial, sans-serif",color:"#304657",size:12},
@@ -484,6 +514,7 @@ def write_dashboard(records, features):
           showcountries:false,showsubunits:true,subunitcolor:"#b9c7ce"
         }
       };
+      
       const yieldPromise = Plotly.react("countyMap", [{
         type:"choropleth",
         geojson:__COUNTY_GEOJSON_URL__,
@@ -492,7 +523,7 @@ def write_dashboard(records, features):
         z:mapRows.map(r => r.p),
         zmin:Math.min(...yieldValues),
         zmax:Math.max(...yieldValues),
-        colorscale:[[0,"#FFFFFF"],[0.2,"#E9F3EF"],[0.5,"#AFCFC0"],[0.8,"#67A287"],[1,"#28634E"]],
+        colorscale:[[0,"#AFCFC0"],[1,"#28634E"]],
         marker:{line:{color:"#ffffff",width:0.25}},
         colorbar:{title:{text:"Yield<br>(bu/ac)"},thickness:18},
         customdata,
@@ -508,6 +539,7 @@ def write_dashboard(records, features):
           "Seed SD (not a confidence interval): %{customdata[7]:.2f} bu/ac<br>" +
           "Seeds: %{customdata[8]}<extra></extra>"
       }],geoLayout,plotConfig);
+      
       const errorPromise = Plotly.react("countyErrorMap", [{
         type:"choropleth",
         geojson:__COUNTY_GEOJSON_URL__,
@@ -517,7 +549,7 @@ def write_dashboard(records, features):
         zmin:-errorLimit,
         zmax:errorLimit,
         zmid:0,
-        colorscale:[[0,"#A8443D"],[0.35,"#E6B8B1"],[0.5,"#FFFFFF"],[0.65,"#B8D3C5"],[1,"#39826C"]],
+        colorscale:[[0,"#A8443D"],[1,"#39826C"]],
         marker:{line:{color:"#ffffff",width:0.25}},
         colorbar:{title:{text:"Error<br>(bu/ac)"},thickness:18},
         customdata:errorCustomdata,
@@ -533,6 +565,7 @@ def write_dashboard(records, features):
           "Seed SD (not a confidence interval): %{customdata[8]:.2f} bu/ac<br>" +
           "Seeds: %{customdata[9]}<extra></extra>"
       }],geoLayout,plotConfig);
+      
       const intervalPromise = Plotly.react("countyIntervalMap", [{
         type:"choropleth",
         geojson:__COUNTY_GEOJSON_URL__,
@@ -541,7 +574,7 @@ def write_dashboard(records, features):
         z:intervalStats.map(value => value.width),
         zmin:intervalMin,
         zmax:intervalMax > intervalMin ? intervalMax : intervalMin + 1,
-        colorscale:[[0,"#39826C"],[0.5,"#FFFFFF"],[1,"#B9503D"]],
+        colorscale:[[0,"#39826C"],[1,"#B9503D"]],
         marker:{line:{color:"#ffffff",width:0.25}},
         colorbar:{title:{text:"CI width<br>(bu/ac)"},thickness:18},
         customdata:mapRows.map((r,index) => [
@@ -558,6 +591,7 @@ def write_dashboard(records, features):
           "Mean predicted yield: %{customdata[6]:.1f} bu/ac<br>" +
           "Seeds: %{customdata[7]}<extra></extra>"
       }],geoLayout,plotConfig);
+      
       const cvPromise = Plotly.react("countyCvMap", [{
         type:"choropleth",
         geojson:__COUNTY_GEOJSON_URL__,
@@ -579,16 +613,38 @@ def write_dashboard(records, features):
           "Mean predicted yield: %{customdata[5]:.1f} bu/ac<br>" +
           "Seeds: %{customdata[6]}<extra></extra>"
       }],geoLayout,plotConfig);
-      Promise.all([yieldPromise,errorPromise,intervalPromise,cvPromise]).then(() => {
+
+      const r2Promise = Plotly.react("countyR2Map", [{
+        type:"choropleth",
+        geojson:__COUNTY_GEOJSON_URL__,
+        featureidkey:"id",
+        locations:mapRows.map(r => r.f),
+        z:r2Values,
+        zmin:r2Min,
+        zmax:r2Max,
+        colorscale:[[0,"#AFCFC0"],[1,"#28634E"]],
+        marker:{line:{color:"#ffffff",width:0.25}},
+        colorbar:{title:{text:"R²"},thickness:18},
+        customdata:mapRows.map((r,index) => [r.c,r.st,r.f,r2Values[index],doyRows.filter(x => x.f === r.f).length]),
+        hovertemplate:
+          "<b>%{customdata[0]}, %{customdata[1]}</b><br>" +
+          "FIPS: %{customdata[2]}<br>" +
+          `DOY ${doy} (across years)<br>` +
+          "R²: %{customdata[3]:.2f}<br>" +
+          "Years in calculation: %{customdata[4]}<extra></extra>"
+      }],geoLayout,plotConfig);
+
+      Promise.all([yieldPromise,errorPromise,intervalPromise,cvPromise,r2Promise]).then(() => {
         renderedMapKey = mapKey;
       }).catch(error => {
         renderedMapKey = "";
-        console.error("County yield, error, confidence interval, or CV map failed to render.",error);
+        console.error("County yield, error, confidence interval, CV, or R2 map failed to render.",error);
         const message = "Map could not be loaded. Check your internet connection and reload; county boundary data is loaded from Plotly's public GeoJSON.";
         if (!document.querySelector("#countyMap .choroplethlocation")) yieldStatus.textContent = message;
         if (!document.querySelector("#countyErrorMap .choroplethlocation")) errorStatus.textContent = message;
         if (!document.querySelector("#countyIntervalMap .choroplethlocation")) intervalStatus.textContent = message;
         if (!document.querySelector("#countyCvMap .choroplethlocation")) cvStatus.textContent = message;
+        if (!document.querySelector("#countyR2Map .choroplethlocation")) r2Status.textContent = message;
       });
     }
     function dateLabels(doys) {
@@ -704,7 +760,6 @@ def write_dashboard(records, features):
     page = page.replace("__FEATURES__", feature_payload)
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT_FILE.write_text(page, encoding="utf-8")
-
 
 def main():
     records = read_seed_predictions()
