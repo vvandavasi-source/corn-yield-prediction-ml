@@ -634,7 +634,7 @@ def write_dashboard(records, features):
         zmax:globalMapBounds.errorLimit,
         zmid:0,
         zauto:false,
-        colorscale:[[0,"#A8443D"],[0.5,"#FFFFFF"],[1,"#39826C"]],
+        colorscale:[[0,"#A8443D"],[1,"#39826C"]],
         marker:{line:{color:"#ffffff",width:0.25}},
         colorbar:{title:{text:"Error<br>(bu/ac)"},thickness:18},
         customdata:errorCustomdata,
