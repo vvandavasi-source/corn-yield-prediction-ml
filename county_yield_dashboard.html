@@ -117,7 +117,7 @@
         <div class="map-grid">
           <div>
             <h2>Coefficient of variation in predicted yield</h2>
-            <p>Seed standard deviation ÷ absolute mean prediction; green = lower variation, red = higher variation.</p>
+            <p>Seed standard deviation ÷ mean prediction (masked when predicted yield &lt; 10 bu/ac; color scale capped at 99th percentile); green = lower variation, red = higher variation.</p>
             <div id="cvMapStatus" class="map-status" role="status" aria-live="polite"></div>
             <div id="countyCvMap" class="map-chart"></div>
           </div>
@@ -179,6 +179,101 @@
     const tCriticalBySampleSize = [NaN,12.70620474,4.30265273,3.18244631,2.77644511,2.57058184,2.44691185,2.36462425,2.30600414,2.26215716,2.22813885,2.20098516,2.17881283,2.16036866,2.14478669,2.13144955,2.11990530,2.10981558,2.10092204,2.09302405,2.08596345,2.07961384,2.07387307,2.06865761,2.06389856,2.05953855,2.05552944,2.05183052,2.04840714,2.04522964,2.04227246,2.03951345,2.03693334,2.03451530,2.03224451,2.03010793,2.02809400,2.02619246,2.02439416,2.02269092,2.02107539,2.01954097,2.01808170,2.01669220,2.01536757,2.01410339,2.01289560,2.01174051,2.01063476,2.00957524];
     const round = value => Number.isFinite(value) ? value.toFixed(1) : "—";
     const byDoy = (a,b) => a.d-b.d;
+
+    const MIN_CV_PRED_YIELD = 10; // bu/ac floor to prevent near-zero denominator CV blowup
+
+    function computeIntervalWidth(r) {
+      const critical = tCriticalBySampleSize[r.n - 1];
+      const margin = r.n > 1 && Number.isFinite(critical) ? critical * r.sd / Math.sqrt(r.n) : NaN;
+      return Number.isFinite(margin) ? 2 * margin : NaN;
+    }
+
+    function computeSafeCv(r) {
+      if (!Number.isFinite(r.p) || !Number.isFinite(r.sd) || r.p < MIN_CV_PRED_YIELD) {
+        return NaN;
+      }
+      const cv = (100 * r.sd) / r.p;
+      return Number.isFinite(cv) ? cv : NaN;
+    }
+
+    // Precompute global map color-scale bounds across ALL scenarios, years, and observation dates
+    const globalMapBounds = (() => {
+      let yieldMin = Infinity, yieldMax = -Infinity;
+      let maxAbsError = 1;
+      let intervalMin = Infinity, intervalMax = -Infinity;
+      const validCvs = [];
+
+      for (const r of rows) {
+        if (Number.isFinite(r.p)) {
+          if (r.p < yieldMin) yieldMin = r.p;
+          if (r.p > yieldMax) yieldMax = r.p;
+        }
+        if (Number.isFinite(r.p) && Number.isFinite(r.a)) {
+          const absErr = Math.abs(r.p - r.a);
+          if (absErr > maxAbsError) maxAbsError = absErr;
+        }
+        const width = computeIntervalWidth(r);
+        if (Number.isFinite(width)) {
+          if (width < intervalMin) intervalMin = width;
+          if (width > intervalMax) intervalMax = width;
+        }
+        const cv = computeSafeCv(r);
+        if (Number.isFinite(cv)) {
+          validCvs.push(cv);
+        }
+      }
+
+      // Compute global R² bounds across all (scenario, doy, fips) groups
+      const byScenarioDoyFips = new Map();
+      for (const r of rows) {
+        const key = `${r.s}|${r.d}|${r.f}`;
+        let group = byScenarioDoyFips.get(key);
+        if (!group) {
+          group = [];
+          byScenarioDoyFips.set(key, group);
+        }
+        group.push(r);
+      }
+
+      let r2Min = Infinity, r2Max = -Infinity;
+      for (const group of byScenarioDoyFips.values()) {
+        if (group.length < 2) continue;
+        const meanA = group.reduce((sum, x) => sum + x.a, 0) / group.length;
+        const ssTot = group.reduce((sum, x) => sum + Math.pow(x.a - meanA, 2), 0);
+        const ssRes = group.reduce((sum, x) => sum + Math.pow(x.a - x.p, 2), 0);
+        if (ssTot > 0) {
+          const r2 = 1 - (ssRes / ssTot);
+          if (Number.isFinite(r2)) {
+            if (r2 < r2Min) r2Min = r2;
+            if (r2 > r2Max) r2Max = r2;
+          }
+        }
+      }
+
+      const safeYieldMin = Number.isFinite(yieldMin) ? yieldMin : 0;
+      const safeYieldMax = Number.isFinite(yieldMax) ? (yieldMax > safeYieldMin ? yieldMax : safeYieldMin + 1) : 1;
+      const safeIntervalMin = Number.isFinite(intervalMin) ? intervalMin : 0;
+      const safeIntervalMax = Number.isFinite(intervalMax) ? (intervalMax > safeIntervalMin ? intervalMax : safeIntervalMin + 1) : 1;
+      validCvs.sort((a, b) => a - b);
+      const safeCvMin = validCvs.length ? validCvs[0] : 0;
+      const p99Cv = validCvs.length ? validCvs[Math.min(validCvs.length - 1, Math.floor(0.99 * validCvs.length))] : 1;
+      const safeCvMax = p99Cv > safeCvMin ? p99Cv : safeCvMin + 1;
+      const safeR2Min = Number.isFinite(r2Min) ? Math.max(-1, r2Min) : 0;
+      const safeR2Max = Number.isFinite(r2Max) ? (r2Max > safeR2Min ? r2Max : safeR2Min + 0.01) : 1;
+
+      return {
+        yieldMin: safeYieldMin,
+        yieldMax: safeYieldMax,
+        errorLimit: maxAbsError,
+        intervalMin: safeIntervalMin,
+        intervalMax: safeIntervalMax,
+        cvMin: safeCvMin,
+        cvMax: safeCvMax,
+        r2Min: safeR2Min,
+        r2Max: safeR2Max
+      };
+    })();
+
     function filteredRows() {
       return rows.filter(r => r.s === scenarioSelect.value && r.sc === stateSelect.value && r.y === Number(yearSelect.value));
     }
@@ -247,7 +342,7 @@
       const cvStatus = document.getElementById("cvMapStatus");
       const r2Status = document.getElementById("r2MapStatus");
       document.getElementById("mapSummary").textContent =
-        `${scenarioSelect.value} · ${year} · DOY ${doy} · ${mapRows.length.toLocaleString()} counties across ${new Set(mapRows.map(r => r.sc)).size} states. Color scale is fixed across dates for this scenario and year.`;
+        `${scenarioSelect.value} · ${year} · DOY ${doy} · ${mapRows.length.toLocaleString()} counties across ${new Set(mapRows.map(r => r.sc)).size} states. Color scales are fixed globally across all scenarios, years, and dates.`;
       
       if (!mapRows.length) {
         renderedMapKey = "";
@@ -272,25 +367,17 @@
       cvStatus.textContent = "";
       r2Status.textContent = "";
       
-      const rangeRows = rows.filter(r => r.s === scenarioSelect.value && r.y === year);
       const customdata = mapRows.map(r => [r.c, r.st, r.f, r.a, r.p-r.a, Math.abs(r.p-r.a), r.t, r.sd, r.n]);
       const errorCustomdata = mapRows.map(r => [r.c, r.st, r.f, r.p, r.a, r.p-r.a, Math.abs(r.p-r.a), r.t, r.sd, r.n]);
-      const yieldValues = rangeRows.map(r => r.p);
-      const errorLimit = Math.max(1, ...rangeRows.map(r => Math.abs(r.p-r.a)));
       const intervalStats = mapRows.map(r => {
-        const critical = tCriticalBySampleSize[r.n - 1];
-        const margin = r.n > 1 && Number.isFinite(critical) ? critical * r.sd / Math.sqrt(r.n) : NaN;
+        const width = computeIntervalWidth(r);
+        const margin = Number.isFinite(width) ? width / 2 : NaN;
         const lower = Number.isFinite(margin) ? r.p - margin : NaN;
         const upper = Number.isFinite(margin) ? r.p + margin : NaN;
-        return {lower, upper, width: upper - lower};
+        return {lower, upper, width};
       });
-      const intervalWidths = intervalStats.map(value => value.width).filter(Number.isFinite);
-      const intervalMin = intervalWidths.length ? Math.min(...intervalWidths) : 0;
-      const intervalMax = intervalWidths.length ? Math.max(...intervalWidths) : 1;
-      const cvValues = mapRows.map(r => r.p !== 0 ? 100 * r.sd / Math.abs(r.p) : NaN);
-      const finiteCvValues = cvValues.filter(Number.isFinite);
-      const cvMin = finiteCvValues.length ? Math.min(...finiteCvValues) : 0;
-      const cvMax = finiteCvValues.length ? Math.max(...finiteCvValues) : 1;
+      const cvValues = mapRows.map(computeSafeCv);
+      const cvDisplay = value => Number.isFinite(value) ? `${value.toFixed(2)}%` : `Masked (predicted yield < ${MIN_CV_PRED_YIELD} bu/ac)`;
       const intervalDisplay = value => Number.isFinite(value) ? value.toFixed(1) : "Unavailable";
       
       // Calculate R2 across all available years for the selected scenario and DOY
@@ -303,9 +390,6 @@
         const ssRes = cRows.reduce((sum, x) => sum + Math.pow(x.a - x.p, 2), 0);
         return ssTot > 0 ? 1 - (ssRes / ssTot) : NaN;
       });
-      const finiteR2 = r2Values.filter(Number.isFinite);
-      const r2Min = finiteR2.length ? Math.max(-1, Math.min(...finiteR2)) : 0;
-      const r2Max = finiteR2.length ? Math.max(...finiteR2) : 1;
 
       const geoLayout = {
         autosize:true,paper_bgcolor:"#fff",plot_bgcolor:"#fff",
@@ -324,8 +408,9 @@
         featureidkey:"id",
         locations:mapRows.map(r => r.f),
         z:mapRows.map(r => r.p),
-        zmin:Math.min(...yieldValues),
-        zmax:Math.max(...yieldValues),
+        zmin:globalMapBounds.yieldMin,
+        zmax:globalMapBounds.yieldMax,
+        zauto:false,
         colorscale:[[0,"#AFCFC0"],[1,"#28634E"]],
         marker:{line:{color:"#ffffff",width:0.25}},
         colorbar:{title:{text:"Yield<br>(bu/ac)"},thickness:18},
@@ -349,10 +434,11 @@
         featureidkey:"id",
         locations:mapRows.map(r => r.f),
         z:mapRows.map(r => r.p-r.a),
-        zmin:-errorLimit,
-        zmax:errorLimit,
+        zmin:-globalMapBounds.errorLimit,
+        zmax:globalMapBounds.errorLimit,
         zmid:0,
-        colorscale:[[0,"#A8443D"],[1,"#39826C"]],
+        zauto:false,
+        colorscale:[[0,"#A8443D"],[0.5,"#FFFFFF"],[1,"#39826C"]],
         marker:{line:{color:"#ffffff",width:0.25}},
         colorbar:{title:{text:"Error<br>(bu/ac)"},thickness:18},
         customdata:errorCustomdata,
@@ -375,8 +461,9 @@
         featureidkey:"id",
         locations:mapRows.map(r => r.f),
         z:intervalStats.map(value => value.width),
-        zmin:intervalMin,
-        zmax:intervalMax > intervalMin ? intervalMax : intervalMin + 1,
+        zmin:globalMapBounds.intervalMin,
+        zmax:globalMapBounds.intervalMax,
+        zauto:false,
         colorscale:[[0,"#39826C"],[1,"#B9503D"]],
         marker:{line:{color:"#ffffff",width:0.25}},
         colorbar:{title:{text:"CI width<br>(bu/ac)"},thickness:18},
@@ -401,17 +488,18 @@
         featureidkey:"id",
         locations:mapRows.map(r => r.f),
         z:cvValues,
-        zmin:cvMin,
-        zmax:cvMax > cvMin ? cvMax : cvMin + 1,
+        zmin:globalMapBounds.cvMin,
+        zmax:globalMapBounds.cvMax,
+        zauto:false,
         colorscale:[[0,"#39826C"],[1,"#B9503D"]],
         marker:{line:{color:"#ffffff",width:0.25}},
         colorbar:{title:{text:"CV (%)"},thickness:18},
-        customdata:mapRows.map((r,index) => [r.c,r.st,r.f,cvValues[index],r.sd,r.p,r.n]),
+        customdata:mapRows.map((r,index) => [r.c,r.st,r.f,cvDisplay(cvValues[index]),r.sd,r.p,r.n]),
         hovertemplate:
           "<b>%{customdata[0]}, %{customdata[1]}</b><br>" +
           "FIPS: %{customdata[2]}<br>" +
           `Year ${year} · DOY ${doy}<br>` +
-          "Coefficient of variation: %{customdata[3]:.2f}%<br>" +
+          "Coefficient of variation: %{customdata[3]}<br>" +
           "Seed SD: %{customdata[4]:.2f} bu/ac<br>" +
           "Mean predicted yield: %{customdata[5]:.1f} bu/ac<br>" +
           "Seeds: %{customdata[6]}<extra></extra>"
@@ -423,8 +511,9 @@
         featureidkey:"id",
         locations:mapRows.map(r => r.f),
         z:r2Values,
-        zmin:r2Min,
-        zmax:r2Max,
+        zmin:globalMapBounds.r2Min,
+        zmax:globalMapBounds.r2Max,
+        zauto:false,
         colorscale:[[0,"#AFCFC0"],[1,"#28634E"]],
         marker:{line:{color:"#ffffff",width:0.25}},
         colorbar:{title:{text:"R²"},thickness:18},
