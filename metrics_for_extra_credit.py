@@ -43,9 +43,9 @@ def build_summary_table(
         rows.append(
             {
                 "Crop-mask scenario": label,
-                "RMSE (bu ac⁻¹)": round(s_sub["rmse_mean"].mean(), 2),
-                "MAE (bu ac⁻¹)": round(s_sub["mae_mean"].mean(), 2),
-                "R² (–)": round(s_sub["r2_mean"].mean(), 3),
+                "RMSE (bu ac⁻¹)": str(str(round(s_sub["rmse_mean"].mean(), 2))+"+-"+str(round(s_sub["rmse_mean"].std(), 2))),
+                "MAE (bu ac⁻¹)": str(str(round(s_sub["mae_mean"].mean(), 2))+"+-"+ str(round(s_sub["mae_mean"].std(), 2))),
+                "R² (–)": str(str(round(s_sub["r2_mean"].mean(), 3))+ "+-"+ str(round(s_sub["r2_mean"].std(), 3))),
                 "Mean bias (bu ac⁻¹)": round(p_sub["bias"].mean(), 2),
                 "Periods, n (years)": f"{n_periods} ({n_years} y, {year_range})",
             }
